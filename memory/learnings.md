@@ -17,3 +17,24 @@ _Learned: 2026-02-22 03:08_
 The home directory contains various configuration files and directories (e.g., .config, .ssh, .zshrc), system directories (e.g., Applications, Desktop, Documents, Downloads, Library, Movies, Music, Pictures, Public), and development-related directories (e.g., Developer, .bun, .dart-tool, .flutter, .gitconfig, .npm, .rustup, .vscode).
 
 ---
+
+## User Profile
+_Learned: 2026-02-22 04:01_
+
+User's name is Bharath. They are the creator.
+
+---
+
+## zsh Alias
+_Learned: 2026-02-22 07:19_
+
+Added an alias `c='clear'` to the `~/.zshrc` file for easily clearing the terminal.
+
+---
+
+## zsh Alias
+_Learned: 2026-02-22 07:28_
+
+Added an alias `c='clear'` to the `~/.zshrc` file for easily clearing the terminal.
+
+---

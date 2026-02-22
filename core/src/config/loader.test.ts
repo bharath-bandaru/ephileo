@@ -12,6 +12,14 @@ import { _resetConfigCacheForTesting, getActiveProvider, loadConfig } from "./lo
 const mockedExistsSync = vi.mocked(existsSync);
 const mockedReadFileSync = vi.mocked(readFileSync);
 
+const VALID_YAML = `
+provider: exo
+providers:
+  exo:
+    baseUrl: http://localhost:52415/v1
+    model: test-model
+`;
+
 describe("loadConfig", () => {
   const originalEnv = { ...process.env };
 
@@ -30,18 +38,29 @@ describe("loadConfig", () => {
     process.env = { ...originalEnv };
   });
 
-  it("returns defaults when no config file exists", () => {
+  it("throws when config file is missing", () => {
     mockedExistsSync.mockReturnValue(false);
-    const config = loadConfig();
-
-    expect(config.provider).toBe("exo");
-    expect(config.providers.exo).toBeDefined();
-    expect(config.providers.exo.baseUrl).toBe("http://localhost:52415/v1");
-    expect(config.agent.maxTurns).toBe(20);
-    expect(config.agent.maxTokens).toBe(4096);
+    expect(() => loadConfig()).toThrow("Config file not found");
   });
 
-  it("merges file config over defaults", () => {
+  it("throws when provider is missing from config", () => {
+    mockedExistsSync.mockReturnValue(true);
+    mockedReadFileSync.mockReturnValue(`
+providers:
+  exo:
+    baseUrl: http://localhost:52415/v1
+    model: test
+`);
+    expect(() => loadConfig()).toThrow("Missing 'provider'");
+  });
+
+  it("throws when no providers are configured", () => {
+    mockedExistsSync.mockReturnValue(true);
+    mockedReadFileSync.mockReturnValue("provider: exo\n");
+    expect(() => loadConfig()).toThrow("No providers configured");
+  });
+
+  it("loads config from yaml file", () => {
     mockedExistsSync.mockReturnValue(true);
     mockedReadFileSync.mockReturnValue(`
 provider: ollama
@@ -54,11 +73,14 @@ providers:
     const config = loadConfig();
     expect(config.provider).toBe("ollama");
     expect(config.providers.ollama.model).toBe("llama3");
-    // Default exo provider should still be present from merge
-    expect(config.providers.exo).toBeDefined();
+    // No default exo provider — only what's in the file
+    expect(config.providers.exo).toBeUndefined();
   });
 
   it("applies environment variable overrides", () => {
+    mockedExistsSync.mockReturnValue(true);
+    mockedReadFileSync.mockReturnValue(VALID_YAML);
+
     process.env.EPHILEO_PROVIDER = "custom";
     process.env.EPHILEO_BASE_URL = "http://custom:8000/v1";
     process.env.EPHILEO_MODEL = "test-model";
@@ -69,11 +91,20 @@ providers:
     expect(config.providers.custom.model).toBe("test-model");
   });
 
-  it("resolves relative memory dir to absolute path", () => {
-    mockedExistsSync.mockReturnValue(false);
-    const config = loadConfig();
+  it("uses agent defaults when not specified in yaml", () => {
+    mockedExistsSync.mockReturnValue(true);
+    mockedReadFileSync.mockReturnValue(VALID_YAML);
 
-    // Default memory dir is "./memory" which should be resolved to absolute
+    const config = loadConfig();
+    expect(config.agent.maxTurns).toBe(20);
+    expect(config.agent.maxTokens).toBe(4096);
+  });
+
+  it("resolves relative memory dir to absolute path", () => {
+    mockedExistsSync.mockReturnValue(true);
+    mockedReadFileSync.mockReturnValue(VALID_YAML);
+
+    const config = loadConfig();
     expect(config.memory.dir).toMatch(/^\//);
     expect(config.memory.dir).toContain("memory");
   });

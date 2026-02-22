@@ -9,6 +9,7 @@ import { execSync } from "node:child_process";
 import { appendFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
+import { registerEditTool } from "./edit.js";
 import type { ToolRegistry } from "./registry.js";
 
 const MAX_FILE_READ_CHARS = 10_000;
@@ -37,7 +38,9 @@ export function registerBasicTools(registry: ToolRegistry, memoryDir: string): v
 
   registry.register({
     name: "write_file",
-    description: "Write content to a file. Creates parent directories if needed.",
+    description:
+      "Create a NEW file with the given content. OVERWRITES the entire file if it exists. " +
+      "For editing existing files, use edit_file instead. Creates parent directories if needed.",
     parameters: {
       type: "object",
       properties: {
@@ -46,6 +49,7 @@ export function registerBasicTools(registry: ToolRegistry, memoryDir: string): v
       },
       required: ["path", "content"],
     },
+    requiresConfirmation: true,
     async handler(args) {
       const p = resolve(String(args.path).replace(/^~/, homedir()));
       await mkdir(dirname(p), { recursive: true });
@@ -135,4 +139,6 @@ export function registerBasicTools(registry: ToolRegistry, memoryDir: string): v
       return `Saved learning about '${args.topic}' to ${journal}`;
     },
   });
+
+  registerEditTool(registry);
 }

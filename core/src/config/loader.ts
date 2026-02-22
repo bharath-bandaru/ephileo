@@ -3,8 +3,7 @@
  *
  * Resolution order (highest priority wins):
  *   1. Environment variables (EPHILEO_PROVIDER, EPHILEO_BASE_URL, etc.)
- *   2. config.yaml
- *   3. Built-in defaults
+ *   2. config.yaml (required — must define provider and at least one provider entry)
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -36,24 +35,15 @@ export interface EphileoConfig {
   memory: MemoryConfig;
 }
 
-// --- Defaults ---
+// --- Defaults (agent + memory only, provider must come from config.yaml) ---
 
-const DEFAULTS: EphileoConfig = {
-  provider: "exo",
-  providers: {
-    exo: {
-      baseUrl: "http://localhost:52415/v1",
-      model: "mlx-community/Qwen3-30B-A3B-4bit",
-    },
-  },
-  agent: {
-    maxTurns: 20,
-    maxTokens: 4096,
-  },
-  memory: {
-    dir: "./memory",
-  },
-};
+const DEFAULT_MAX_TURNS = 20;
+const DEFAULT_MAX_TOKENS = 4096;
+const DEFAULT_MEMORY_DIR = "./memory";
+
+const CONFIG_HINT =
+  "See config/config.example.yaml for a complete template.\n" +
+  "Quick start: cp config/config.example.yaml config/config.yaml";
 
 // --- Loader ---
 
@@ -82,19 +72,43 @@ export function loadConfig(): EphileoConfig {
   const projectRoot = getProjectRoot();
   const configPath = resolve(projectRoot, "config", "config.yaml");
 
-  let fileConfig: Partial<EphileoConfig> = {};
-
-  if (existsSync(configPath)) {
-    const raw = readFileSync(configPath, "utf-8");
-    fileConfig = parseYaml(raw) || {};
+  if (!existsSync(configPath)) {
+    throw new Error(
+      `Config file not found at ${configPath}.\n` +
+        "Create config/config.yaml with your provider settings:\n\n" +
+        CONFIG_HINT,
+    );
   }
 
-  // Merge: defaults <- file config
+  const raw = readFileSync(configPath, "utf-8");
+  const fileConfig: Partial<EphileoConfig> = parseYaml(raw) || {};
+
+  if (!fileConfig.provider) {
+    throw new Error(
+      "Missing 'provider' in config/config.yaml.\n" +
+        "Add a provider field at the top of the file:\n\n" +
+        CONFIG_HINT,
+    );
+  }
+
+  if (!fileConfig.providers || Object.keys(fileConfig.providers).length === 0) {
+    throw new Error(
+      "No providers configured in config/config.yaml.\n" +
+        "Add at least one provider with baseUrl and model:\n\n" +
+        CONFIG_HINT,
+    );
+  }
+
   const config: EphileoConfig = {
-    provider: fileConfig.provider ?? DEFAULTS.provider,
-    providers: { ...DEFAULTS.providers, ...fileConfig.providers },
-    agent: { ...DEFAULTS.agent, ...fileConfig.agent },
-    memory: { ...DEFAULTS.memory, ...fileConfig.memory },
+    provider: fileConfig.provider,
+    providers: fileConfig.providers as Record<string, ProviderConfig>,
+    agent: {
+      maxTurns: fileConfig.agent?.maxTurns ?? DEFAULT_MAX_TURNS,
+      maxTokens: fileConfig.agent?.maxTokens ?? DEFAULT_MAX_TOKENS,
+    },
+    memory: {
+      dir: fileConfig.memory?.dir ?? DEFAULT_MEMORY_DIR,
+    },
   };
 
   // Environment variable overrides (highest priority)

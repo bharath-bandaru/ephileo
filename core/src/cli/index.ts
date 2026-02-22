@@ -11,15 +11,18 @@
  * Press 'h' while the agent is thinking to toggle thinking visibility.
  */
 
-import { createInterface } from "node:readline";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { Command } from "commander";
-import { runAgentLoop } from "../agent/index.js";
+import { buildSystemPrompt, runAgentLoop } from "../agent/index.js";
 import { type EphileoConfig, getActiveProvider, loadConfig } from "../config/loader.js";
 import { type ChatMessage, LLMClient } from "../llm/index.js";
 import { registerBasicTools, ToolRegistry } from "../tools/index.js";
+import { readMultiLineInput } from "./input.js";
 
 // ANSI codes
 const DIM = "\x1b[2m";
+const RED = "\x1b[31m";
 const GREEN = "\x1b[32m";
 const BLUE = "\x1b[34m";
 const YELLOW = "\x1b[33m";
@@ -30,32 +33,68 @@ const KEY_CTRL_C = 3;
 const KEY_H_LOWER = 104;
 const KEY_H_UPPER = 72;
 
+// Spinner animation frames and timing
+const SPINNER_FRAMES = [
+  "\u28CB",
+  "\u2819",
+  "\u2839",
+  "\u2838",
+  "\u283C",
+  "\u2834",
+  "\u2826",
+  "\u2827",
+  "\u2807",
+  "\u280F",
+];
+const SPINNER_INTERVAL_MS = 80;
+
 // Thinking visibility state — persists across turns, toggled with 'h'
 let showThinking = true;
 
-const SYSTEM_PROMPT = `You are Ephileo, a local AI assistant running on the user's machine. You have \
-access to tools that let you interact with the filesystem, run commands, and \
-record what you learn.
+interface AskResult {
+  response: string;
+  hadThinking: boolean;
+}
 
-Guidelines:
-- Use tools when you need to take actions. Don't just describe what you would do — actually do it.
-- When you discover something interesting or learn something new, use save_learning to record it.
-- Be direct and concise.
-- You run fully locally — no data leaves this machine.
-- If a task requires multiple steps, work through them one at a time.`;
+interface AskOptions {
+  maxTurns?: number;
+  /** Suppress [turn] logs and thinking display (used for init call). */
+  silent?: boolean;
+}
+
+function formatError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  const lines = msg.split("\n");
+  const errorLine = `${RED}${lines[0]}${RESET}`;
+  const instructionLines = lines.slice(1).map((l) => `${GREEN}${l}${RESET}`);
+  return [errorLine, ...instructionLines].join("\n");
+}
+
+function loadMemory(memoryDir: string): string {
+  try {
+    return readFileSync(resolve(memoryDir, "learnings.md"), "utf-8");
+  } catch {
+    return "";
+  }
+}
 
 function createAgent() {
-  const config = loadConfig();
-  const provider = getActiveProvider(config);
-  const llm = new LLMClient({
-    baseUrl: provider.baseUrl,
-    model: provider.model,
-    apiKey: provider.apiKey,
-    maxTokens: config.agent.maxTokens,
-  });
-  const tools = new ToolRegistry();
-  registerBasicTools(tools, config.memory.dir);
-  return { llm, tools, config };
+  try {
+    const config = loadConfig();
+    const provider = getActiveProvider(config);
+    const llm = new LLMClient({
+      baseUrl: provider.baseUrl,
+      model: provider.model,
+      apiKey: provider.apiKey,
+      maxTokens: config.agent.maxTokens,
+    });
+    const tools = new ToolRegistry();
+    registerBasicTools(tools, config.memory.dir);
+    return { llm, tools, config };
+  } catch (err: unknown) {
+    console.error(`\n${formatError(err)}\n`);
+    process.exit(1);
+  }
 }
 
 /**
@@ -94,18 +133,36 @@ function startHotkeyListener(): () => void {
   };
 }
 
+/** Animated spinner for long-running silent operations. Returns a stop function. */
+function startSpinner(message: string): () => void {
+  let frameIdx = 0;
+  process.stderr.write(`${message} ${YELLOW}${SPINNER_FRAMES[0]}${RESET}`);
+  const timer = setInterval(() => {
+    frameIdx = (frameIdx + 1) % SPINNER_FRAMES.length;
+    process.stderr.write(`\r${message} ${YELLOW}${SPINNER_FRAMES[frameIdx]}${RESET}`);
+  }, SPINNER_INTERVAL_MS);
+
+  return () => {
+    clearInterval(timer);
+    process.stderr.write(`\r${" ".repeat(message.length + 2)}\r`);
+  };
+}
+
 async function ask(
   input: string,
   llm: LLMClient,
   tools: ToolRegistry,
-  maxTurns?: number,
-): Promise<string> {
+  systemPrompt: string,
+  opts: AskOptions = {},
+): Promise<AskResult> {
+  const { maxTurns, silent = false } = opts;
   const messages: ChatMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: systemPrompt },
     { role: "user", content: input },
   ];
 
   let lastWasThinking = false;
+  let detectedThinking = false;
 
   // Start listening for 'h' hotkey during agent execution
   const stopHotkeys = startHotkeyListener();
@@ -117,19 +174,21 @@ async function ask(
       tools,
       // Log function for turn/tool events
       (msg) => {
+        if (silent) return;
         if (lastWasThinking) {
           process.stderr.write(`${RESET}\n`);
           lastWasThinking = false;
         }
         process.stderr.write(`  ${GREEN}${msg}${RESET}\n`);
       },
-      // Live streaming callback
+      // Live streaming callback — always tracks thinking, only displays when not silent
       (token, isThinking) => {
         if (isThinking) {
-          if (showThinking) {
+          detectedThinking = true;
+          if (!silent && showThinking) {
             process.stderr.write(`${DIM}${token}${RESET}`);
           }
-          lastWasThinking = true;
+          lastWasThinking = !silent;
         } else {
           if (lastWasThinking) {
             if (showThinking) {
@@ -146,9 +205,9 @@ async function ask(
       process.stderr.write(`${RESET}\n`);
     }
 
-    return result.response;
+    return { response: result.response, hadThinking: detectedThinking };
   } finally {
-    // Restore stdin for readline
+    // Restore stdin so the input handler can use it
     stopHotkeys();
   }
 }
@@ -157,47 +216,69 @@ async function repl(llm: LLMClient, tools: ToolRegistry, config: EphileoConfig):
   console.log("Ephileo v0.1 — Local AI Agent");
   console.log(`Provider: ${config.provider} (${llm.opts.model})`);
   console.log(`Tools: ${tools.listNames().join(", ")}`);
-  console.log(`Press ${YELLOW}h${RESET} while thinking to toggle thought visibility.`);
+
+  // Initial LLM call — detects thinking support and greets/asks name (silent: no logs/thinking)
+  const stopSpinner = startSpinner("waking ephileo...");
+  const memory = loadMemory(config.memory.dir);
+  const systemPrompt = buildSystemPrompt(memory);
+  let greeting: string;
+  let hadThinking: boolean;
+  try {
+    const result = await ask("Hello! Introduce yourself briefly.", llm, tools, systemPrompt, {
+      maxTurns: config.agent.maxTurns,
+      silent: true,
+    });
+    greeting = result.response;
+    hadThinking = result.hadThinking;
+  } catch (err: unknown) {
+    stopSpinner();
+    console.error(`\n${formatError(err)}\n`);
+    process.exit(1);
+  }
+  stopSpinner();
+
+  if (hadThinking) {
+    console.log(`Press ${YELLOW}h${RESET} while thinking to toggle thought visibility.`);
+  }
+  console.log("Shift+Enter for new line, Enter to send.");
   console.log('Type "quit" to exit.\n');
+  console.log(`${BLUE}ephileo>${RESET} ${greeting}\n`);
 
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: `${BLUE}you> ${RESET}`,
-  });
+  const prompt = `${BLUE}> ${RESET}`;
+  const continuationPrompt = `${BLUE}..${RESET} `;
 
-  rl.prompt();
+  // Main REPL loop — each iteration reads one multi-line input
+  for (;;) {
+    const result = await readMultiLineInput({ prompt, continuationPrompt });
 
-  rl.on("line", async (line) => {
-    const input = line.trim();
-    if (!input) {
-      rl.prompt();
-      return;
+    if (result.kind === "eof") {
+      console.log("Goodbye.");
+      process.exit(0);
     }
+
+    const input = result.value.trim();
+    if (!input) continue;
+
     if (input.toLowerCase() === "quit" || input.toLowerCase() === "exit") {
       console.log("Goodbye.");
-      rl.close();
-      return;
+      process.exit(0);
     }
 
-    // Show labelled echo of user input
-    process.stderr.write(`  ${GREEN}[user]${RESET} ${input}\n`);
-
-    // Pause readline so it doesn't conflict with raw mode hotkeys
-    rl.pause();
+    // Show labelled echo of user input (replace newlines for compact display)
+    const displayInput = input.includes("\n") ? input.replace(/\n/g, " \\n ") : input;
+    process.stderr.write(`  ${GREEN}[user]${RESET} ${displayInput}\n`);
 
     try {
-      const response = await ask(input, llm, tools, config.agent.maxTurns);
+      const freshMemory = loadMemory(config.memory.dir);
+      const freshPrompt = buildSystemPrompt(freshMemory);
+      const { response } = await ask(input, llm, tools, freshPrompt, {
+        maxTurns: config.agent.maxTurns,
+      });
       console.log(`\n${BLUE}ephileo>${RESET} ${response}\n`);
-    } catch (err) {
-      console.error(`\n[error] ${err instanceof Error ? err.message : String(err)}\n`);
+    } catch (err: unknown) {
+      console.error(`\n${formatError(err)}\n`);
     }
-
-    rl.resume();
-    rl.prompt();
-  });
-
-  rl.on("close", () => process.exit(0));
+  }
 }
 
 // --- CLI program ---
@@ -212,7 +293,11 @@ program
   .argument("<input...>", "Your question or task")
   .action(async (inputParts: string[]) => {
     const { llm, tools, config } = createAgent();
-    const response = await ask(inputParts.join(" "), llm, tools, config.agent.maxTurns);
+    const memory = loadMemory(config.memory.dir);
+    const systemPrompt = buildSystemPrompt(memory);
+    const { response } = await ask(inputParts.join(" "), llm, tools, systemPrompt, {
+      maxTurns: config.agent.maxTurns,
+    });
     console.log(response);
   });
 

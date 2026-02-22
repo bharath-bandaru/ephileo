@@ -77,7 +77,7 @@ interface SSEChunk {
 /** Callback for live token display. isThinking=true when inside <think> block. */
 export type OnTokenCallback = (token: string, isThinking: boolean) => void;
 
-const LLM_REQUEST_TIMEOUT_MS = 120_000;
+const LLM_REQUEST_TIMEOUT_MS = 300_000;
 
 export class LLMClient {
   readonly opts: LLMClientOptions;
@@ -113,12 +113,33 @@ export class LLMClient {
       headers.Authorization = `Bearer ${this.opts.apiKey}`;
     }
 
-    const resp = await fetch(`${this.opts.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(`${this.opts.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+        throw new Error(
+          `Could not connect to LLM at ${this.opts.baseUrl}.\n` +
+            "Make sure your LLM provider (exo, ollama, etc.) is running.\n" +
+            "You can change the provider in config/config.yaml under 'provider' and 'providers'.",
+        );
+      }
+      throw err;
+    }
+
+    if (resp.status === 404) {
+      throw new Error(
+        `Model "${this.opts.model}" not found at ${this.opts.baseUrl} (404).\n` +
+          "Check that the model name is correct in config/config.yaml under providers.<your-provider>.model.\n" +
+          `Run 'curl ${this.opts.baseUrl}/models' to see available models.`,
+      );
+    }
 
     if (!resp.ok) {
       const body = await resp.text();

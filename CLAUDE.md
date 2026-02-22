@@ -3,6 +3,17 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 **This file is the highest-priority reference. Follow these rules strictly.**
 
+## Top Priority — Every Change, Every Command
+
+**Before writing any code, these are non-negotiable:**
+
+1. **Tests first.** Every new function, tool, or behavior must have corresponding tests. Write or update tests alongside the implementation — never defer them. If a change cannot be tested, explain why.
+2. **Code quality gates.** Run `npm run check` (Biome lint + tsc) and `npm test` (Vitest) after every change. Zero errors, zero warnings, all tests green — no exceptions.
+3. **Readability and maintainability.** Code is read far more than it is written. Use clear names, small functions, and obvious control flow. If a reviewer would need a comment to understand the code, simplify the code instead.
+4. **Keep files small.** Soft limit: **300 lines** — start planning a split. Hard limit: **500 lines** — must split before merging. Large files are a sign of poor separation of concerns.
+
+These four rules apply to every task — features, bug fixes, refactors, and one-line changes alike.
+
 ## Project
 
 Ephileo is a local-first AI agent — TypeScript orchestrator ("Brain") with Python workers ("Hands", coming later). All AI inference runs locally via exo/ollama or cloud APIs through an OpenAI-compatible interface.
@@ -64,7 +75,7 @@ npm run build        # Compile to dist/
 
 ### Architecture rules
 
-- **Keep files under 300 lines.** Split if approaching this.
+- **Keep files under 300 lines (soft) / 500 lines (hard).** Plan a split at 300, must split at 500.
 - **Parameters over globals.** Pass config/state as function arguments, not module-level variables. The only acceptable module-level mutable state is `showThinking` (CLI-only) and `_cached` (config memo).
 - **Pure functions in library code.** `agent/loop.ts` and `llm/client.ts` must not import CLI or I/O code.
 - **Barrel exports.** Each directory has an `index.ts` that re-exports the public API. Import from the barrel, not from internal files.

@@ -17,6 +17,7 @@ export interface ToolRegistration {
   description: string;
   parameters: Record<string, unknown>;
   handler: ToolHandler;
+  requiresConfirmation?: boolean;
 }
 
 export class ToolRegistry {
