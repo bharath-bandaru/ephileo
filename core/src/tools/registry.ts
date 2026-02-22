@@ -10,9 +10,7 @@
 
 import type { ToolDefinition } from "../llm/index.js";
 
-export interface ToolHandler {
-  (args: Record<string, unknown>): Promise<string>;
-}
+export type ToolHandler = (args: Record<string, unknown>) => Promise<string>;
 
 export interface ToolRegistration {
   name: string;

@@ -5,15 +5,19 @@
  * Add more tools by calling registry.register().
  */
 
-import { readFile, writeFile, appendFile, mkdir, readdir, stat } from "node:fs/promises";
 import { execSync } from "node:child_process";
-import { resolve, dirname } from "node:path";
+import { appendFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
 import type { ToolRegistry } from "./registry.js";
 
-const MEMORY_DIR = resolve(homedir(), "Developer", "ephileo", "memory");
+const MAX_FILE_READ_CHARS = 10_000;
+const MAX_SHELL_OUTPUT_CHARS = 5_000;
+const MAX_SHELL_ERROR_CHARS = 2_000;
+const SHELL_TIMEOUT_MS = 30_000;
+const MAX_DIR_ENTRIES = 100;
 
-export function registerBasicTools(registry: ToolRegistry): void {
+export function registerBasicTools(registry: ToolRegistry, memoryDir: string): void {
   registry.register({
     name: "read_file",
     description: "Read the contents of a file at the given path.",
@@ -27,7 +31,7 @@ export function registerBasicTools(registry: ToolRegistry): void {
     async handler(args) {
       const p = resolve(String(args.path).replace(/^~/, homedir()));
       const content = await readFile(p, "utf-8");
-      return content.slice(0, 10_000); // cap output
+      return content.slice(0, MAX_FILE_READ_CHARS); // cap output
     },
   });
 
@@ -64,7 +68,7 @@ export function registerBasicTools(registry: ToolRegistry): void {
       const p = resolve(String(args.path || ".").replace(/^~/, homedir()));
       const entries = await readdir(p);
       const lines: string[] = [];
-      for (const name of entries.slice(0, 100)) {
+      for (const name of entries.slice(0, MAX_DIR_ENTRIES)) {
         const s = await stat(resolve(p, name));
         lines.push(`  [${s.isDirectory() ? "dir" : "file"}] ${name}`);
       }
@@ -85,14 +89,15 @@ export function registerBasicTools(registry: ToolRegistry): void {
     async handler(args) {
       try {
         const output = execSync(String(args.command), {
-          timeout: 30_000,
+          timeout: SHELL_TIMEOUT_MS,
           encoding: "utf-8",
           stdio: ["pipe", "pipe", "pipe"],
         });
-        return output.slice(0, 5000) || "(no output)";
-      } catch (err: any) {
-        const stderr = err.stderr || err.message || String(err);
-        return `Error: ${String(stderr).slice(0, 2000)}`;
+        return output.slice(0, MAX_SHELL_OUTPUT_CHARS) || "(no output)";
+      } catch (err: unknown) {
+        const error = err as { stderr?: string; message?: string };
+        const stderr = error.stderr ?? error.message ?? String(err);
+        return `Error: ${String(stderr).slice(0, MAX_SHELL_ERROR_CHARS)}`;
       }
     },
   });
@@ -110,8 +115,8 @@ export function registerBasicTools(registry: ToolRegistry): void {
       required: ["topic", "content"],
     },
     async handler(args) {
-      await mkdir(MEMORY_DIR, { recursive: true });
-      const journal = resolve(MEMORY_DIR, "learnings.md");
+      await mkdir(memoryDir, { recursive: true });
+      const journal = resolve(memoryDir, "learnings.md");
       const timestamp = new Date().toISOString().slice(0, 16).replace("T", " ");
       const entry = `\n## ${args.topic}\n_Learned: ${timestamp}_\n\n${args.content}\n\n---\n`;
 

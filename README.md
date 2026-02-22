@@ -147,8 +147,7 @@ EPHILEO_PROVIDER=ollama npx tsx src/cli/index.ts
 ephileo/
 ├── config/                  # Configuration
 │   ├── config.example.yaml  # Template (edit and copy to config.yaml)
-│   ├── config.yaml          # Your config (gitignored, may contain keys)
-│   └── loader.ts            # Reads config, exports typed object
+│   └── config.yaml          # Your config (gitignored, may contain keys)
 │
 ├── core/                    # TypeScript — the brain
 │   └── src/

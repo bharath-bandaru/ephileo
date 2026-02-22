@@ -11,10 +11,11 @@
  * The caller (CLI, daemon, API) manages state/persistence.
  */
 
-import { LLMClient, type ChatMessage, type OnTokenCallback } from "../llm/index.js";
-import { ToolRegistry } from "../tools/index.js";
+import type { ChatMessage, LLMClient, OnTokenCallback } from "../llm/index.js";
+import type { ToolRegistry } from "../tools/index.js";
 
 const MAX_TURNS = 20;
+const TOOL_ARGS_PREVIEW_LENGTH = 80;
 
 export interface AgentResult {
   response: string;
@@ -30,11 +31,12 @@ export async function runAgentLoop(
   tools: ToolRegistry,
   log: LogFn = () => {},
   onToken?: OnTokenCallback,
+  maxTurns: number = MAX_TURNS,
 ): Promise<AgentResult> {
   const schemas = tools.getSchemas();
   const toolsUsed: string[] = [];
 
-  for (let turn = 0; turn < MAX_TURNS; turn++) {
+  for (let turn = 0; turn < maxTurns; turn++) {
     log(`[turn ${turn + 1}]`);
     const response = await llm.chat(messages, schemas, onToken);
 
@@ -64,7 +66,7 @@ export async function runAgentLoop(
 
     // Execute each tool call and add results
     for (const tc of response.toolCalls) {
-      const argsPreview = JSON.stringify(tc.arguments).slice(0, 80);
+      const argsPreview = JSON.stringify(tc.arguments).slice(0, TOOL_ARGS_PREVIEW_LENGTH);
       log(`[tool] ${tc.name}(${argsPreview})`);
       toolsUsed.push(tc.name);
 
@@ -80,7 +82,7 @@ export async function runAgentLoop(
 
   return {
     response: "(max turns reached — stopped for safety)",
-    turns: MAX_TURNS,
+    turns: maxTurns,
     toolsUsed,
   };
 }

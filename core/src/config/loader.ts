@@ -7,8 +7,8 @@
  *   3. Built-in defaults
  */
 
-import { readFileSync, existsSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 
@@ -59,15 +59,28 @@ const DEFAULTS: EphileoConfig = {
 
 let _cached: EphileoConfig | null = null;
 
+/** Reset the config cache. Only for testing. */
+export function _resetConfigCacheForTesting(): void {
+  _cached = null;
+}
+
+/**
+ * Find the project root (ephileo/) by walking up from this file.
+ * This file lives at core/src/config/loader.ts, so project root is 3 levels up.
+ */
+function getProjectRoot(): string {
+  const thisDir = dirname(fileURLToPath(import.meta.url));
+  return resolve(thisDir, "..", "..", "..");
+}
+
 /**
  * Load and return the config. Cached after first call.
  */
 export function loadConfig(): EphileoConfig {
   if (_cached) return _cached;
 
-  // Find config.yaml relative to the project root (ephileo/)
-  const thisDir = dirname(fileURLToPath(import.meta.url));
-  const configPath = resolve(thisDir, "config.yaml");
+  const projectRoot = getProjectRoot();
+  const configPath = resolve(projectRoot, "config", "config.yaml");
 
   let fileConfig: Partial<EphileoConfig> = {};
 
@@ -89,7 +102,6 @@ export function loadConfig(): EphileoConfig {
     config.provider = process.env.EPHILEO_PROVIDER;
   }
   if (process.env.EPHILEO_BASE_URL || process.env.EPHILEO_MODEL || process.env.EPHILEO_API_KEY) {
-    // Env vars override the active provider's settings
     const active = config.providers[config.provider] ?? { baseUrl: "", model: "" };
     config.providers[config.provider] = {
       baseUrl: process.env.EPHILEO_BASE_URL ?? active.baseUrl,
@@ -99,8 +111,7 @@ export function loadConfig(): EphileoConfig {
   }
 
   // Resolve memory dir relative to project root
-  if (!config.memory.dir.startsWith("/")) {
-    const projectRoot = resolve(thisDir, "..");
+  if (!isAbsolute(config.memory.dir)) {
     config.memory.dir = resolve(projectRoot, config.memory.dir);
   }
 

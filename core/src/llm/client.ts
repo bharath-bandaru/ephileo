@@ -53,8 +53,31 @@ export interface LLMClientOptions {
   maxTokens: number;
 }
 
+/** Shape of a single SSE chunk from an OpenAI-compatible streaming response. */
+interface SSEChunkChoice {
+  index: number;
+  delta: {
+    content?: string;
+    tool_calls?: Array<{
+      index?: number;
+      id?: string;
+      function?: {
+        name?: string;
+        arguments?: string;
+      };
+    }>;
+  };
+  finish_reason: string | null;
+}
+
+interface SSEChunk {
+  choices?: SSEChunkChoice[];
+}
+
 /** Callback for live token display. isThinking=true when inside <think> block. */
 export type OnTokenCallback = (token: string, isThinking: boolean) => void;
+
+const LLM_REQUEST_TIMEOUT_MS = 120_000;
 
 export class LLMClient {
   readonly opts: LLMClientOptions;
@@ -87,14 +110,14 @@ export class LLMClient {
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.opts.apiKey) {
-      headers["Authorization"] = `Bearer ${this.opts.apiKey}`;
+      headers.Authorization = `Bearer ${this.opts.apiKey}`;
     }
 
     const resp = await fetch(`${this.opts.baseUrl}/chat/completions`, {
       method: "POST",
       headers,
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
     });
 
     if (!resp.ok) {
@@ -111,7 +134,10 @@ export class LLMClient {
     let insideThink = false;
     let thinkTagBuffer = ""; // buffer for detecting partial <think> or </think> tags
 
-    const reader = resp.body!.getReader();
+    if (!resp.body) {
+      throw new Error("LLM response has no body");
+    }
+    const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let sseBuffer = "";
 
@@ -123,26 +149,27 @@ export class LLMClient {
 
       // Process complete SSE lines
       const lines = sseBuffer.split("\n");
-      sseBuffer = lines.pop()!; // keep incomplete last line in buffer
+      sseBuffer = lines.pop() ?? ""; // keep incomplete last line in buffer
 
       for (const line of lines) {
         if (!line.startsWith("data: ")) continue;
         const data = line.slice(6).trim();
         if (data === "[DONE]") continue;
 
-        let chunk: any;
+        let chunk: SSEChunk;
         try {
           chunk = JSON.parse(data);
         } catch {
           continue;
         }
 
-        const delta = chunk.choices?.[0]?.delta;
-        if (!delta) continue;
+        const choice = chunk.choices?.[0];
+        if (!choice?.delta) continue;
+        const { delta } = choice;
 
         // Accumulate finish reason
-        if (chunk.choices[0].finish_reason) {
-          finishReason = chunk.choices[0].finish_reason;
+        if (choice.finish_reason) {
+          finishReason = choice.finish_reason;
         }
 
         // Handle content tokens
@@ -153,7 +180,7 @@ export class LLMClient {
             // Stream each token through think-block detection
             thinkTagBuffer += delta.content;
             // Process the buffer, emitting tokens with correct isThinking state
-            this.processThinkBuffer(thinkTagBuffer, insideThink, onToken, (newInside, remaining) => {
+            processThinkBuffer(thinkTagBuffer, insideThink, onToken, (newInside, remaining) => {
               insideThink = newInside;
               thinkTagBuffer = remaining;
             });
@@ -164,10 +191,11 @@ export class LLMClient {
         if (delta.tool_calls) {
           for (const tc of delta.tool_calls) {
             const idx = tc.index ?? 0;
-            if (!toolCallAccum.has(idx)) {
-              toolCallAccum.set(idx, { id: "", name: "", arguments: "" });
+            let accum = toolCallAccum.get(idx);
+            if (!accum) {
+              accum = { id: "", name: "", arguments: "" };
+              toolCallAccum.set(idx, accum);
             }
-            const accum = toolCallAccum.get(idx)!;
             if (tc.id) accum.id = tc.id;
             if (tc.function?.name) accum.name += tc.function.name;
             if (tc.function?.arguments) accum.arguments += tc.function.arguments;
@@ -209,73 +237,74 @@ export class LLMClient {
       finishReason,
     };
   }
+}
 
-  /**
-   * Process the think-tag buffer, emitting tokens with correct isThinking state.
-   * Detects <think> and </think> tags even when split across chunks.
-   */
-  private processThinkBuffer(
-    buffer: string,
-    insideThink: boolean,
-    onToken: OnTokenCallback,
-    update: (newInside: boolean, remaining: string) => void,
-  ): void {
-    let pos = 0;
-    let inside = insideThink;
+/**
+ * Process the think-tag buffer, emitting tokens with correct isThinking state.
+ * Detects <think> and </think> tags even when split across chunks.
+ * Extracted as a standalone function for testability.
+ */
+export function processThinkBuffer(
+  buffer: string,
+  insideThink: boolean,
+  onToken: OnTokenCallback,
+  update: (newInside: boolean, remaining: string) => void,
+): void {
+  let pos = 0;
+  let inside = insideThink;
 
-    while (pos < buffer.length) {
-      if (!inside) {
-        // Look for <think>
-        const openIdx = buffer.indexOf("<think>", pos);
-        if (openIdx === -1) {
-          // Check if buffer ends with a partial "<think>" match
-          const partialCheck = "<think>";
-          for (let i = 1; i < partialCheck.length; i++) {
-            if (buffer.endsWith(partialCheck.slice(0, i))) {
-              // Emit everything before the partial match, keep partial in buffer
-              const safe = buffer.slice(pos, buffer.length - i);
-              if (safe) onToken(safe, false);
-              update(inside, buffer.slice(buffer.length - i));
-              return;
-            }
+  while (pos < buffer.length) {
+    if (!inside) {
+      // Look for <think>
+      const openIdx = buffer.indexOf("<think>", pos);
+      if (openIdx === -1) {
+        // Check if buffer ends with a partial "<think>" match
+        const partialCheck = "<think>";
+        for (let i = 1; i < partialCheck.length; i++) {
+          if (buffer.endsWith(partialCheck.slice(0, i))) {
+            // Emit everything before the partial match, keep partial in buffer
+            const safe = buffer.slice(pos, buffer.length - i);
+            if (safe) onToken(safe, false);
+            update(inside, buffer.slice(buffer.length - i));
+            return;
           }
-          // No partial match, emit everything
-          if (pos < buffer.length) onToken(buffer.slice(pos), false);
-          update(inside, "");
-          return;
         }
-        // Emit text before <think>
-        if (openIdx > pos) onToken(buffer.slice(pos, openIdx), false);
-        inside = true;
-        pos = openIdx + 7; // skip past "<think>"
-        onToken("[thinking] ", false); // visual marker
-      } else {
-        // Look for </think>
-        const closeIdx = buffer.indexOf("</think>", pos);
-        if (closeIdx === -1) {
-          // Check for partial "</think>" at end
-          const partialCheck = "</think>";
-          for (let i = 1; i < partialCheck.length; i++) {
-            if (buffer.endsWith(partialCheck.slice(0, i))) {
-              const safe = buffer.slice(pos, buffer.length - i);
-              if (safe) onToken(safe, true);
-              update(inside, buffer.slice(buffer.length - i));
-              return;
-            }
-          }
-          // Emit thinking content
-          if (pos < buffer.length) onToken(buffer.slice(pos), true);
-          update(inside, "");
-          return;
-        }
-        // Emit thinking content before </think>
-        if (closeIdx > pos) onToken(buffer.slice(pos, closeIdx), true);
-        onToken("\n", true); // end thinking line
-        inside = false;
-        pos = closeIdx + 8; // skip past "</think>"
+        // No partial match, emit everything
+        if (pos < buffer.length) onToken(buffer.slice(pos), false);
+        update(inside, "");
+        return;
       }
+      // Emit text before <think>
+      if (openIdx > pos) onToken(buffer.slice(pos, openIdx), false);
+      inside = true;
+      pos = openIdx + 7; // skip past "<think>"
+      onToken("[thinking] ", false); // visual marker
+    } else {
+      // Look for </think>
+      const closeIdx = buffer.indexOf("</think>", pos);
+      if (closeIdx === -1) {
+        // Check for partial "</think>" at end
+        const partialCheck = "</think>";
+        for (let i = 1; i < partialCheck.length; i++) {
+          if (buffer.endsWith(partialCheck.slice(0, i))) {
+            const safe = buffer.slice(pos, buffer.length - i);
+            if (safe) onToken(safe, true);
+            update(inside, buffer.slice(buffer.length - i));
+            return;
+          }
+        }
+        // Emit thinking content
+        if (pos < buffer.length) onToken(buffer.slice(pos), true);
+        update(inside, "");
+        return;
+      }
+      // Emit thinking content before </think>
+      if (closeIdx > pos) onToken(buffer.slice(pos, closeIdx), true);
+      onToken("\n", true); // end thinking line
+      inside = false;
+      pos = closeIdx + 8; // skip past "</think>"
     }
-
-    update(inside, "");
   }
+
+  update(inside, "");
 }

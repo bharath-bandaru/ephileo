@@ -1,9 +1,9 @@
-export { LLMClient } from "./client.js";
 export type {
   ChatMessage,
-  ToolDefinition,
-  ToolCall,
-  LLMResponse,
   LLMClientOptions,
+  LLMResponse,
   OnTokenCallback,
+  ToolCall,
+  ToolDefinition,
 } from "./client.js";
+export { LLMClient, processThinkBuffer } from "./client.js";

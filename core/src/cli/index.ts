@@ -13,18 +13,22 @@
 
 import { createInterface } from "node:readline";
 import { Command } from "commander";
-import { LLMClient, type ChatMessage } from "../llm/index.js";
-import { ToolRegistry, registerBasicTools } from "../tools/index.js";
 import { runAgentLoop } from "../agent/index.js";
-import { loadConfig, getActiveProvider } from "../../../config/loader.js";
+import { type EphileoConfig, getActiveProvider, loadConfig } from "../config/loader.js";
+import { type ChatMessage, LLMClient } from "../llm/index.js";
+import { registerBasicTools, ToolRegistry } from "../tools/index.js";
 
 // ANSI codes
 const DIM = "\x1b[2m";
 const GREEN = "\x1b[32m";
 const BLUE = "\x1b[34m";
-const CYAN = "\x1b[36m";
 const YELLOW = "\x1b[33m";
 const RESET = "\x1b[0m";
+
+// Key codes for hotkey detection
+const KEY_CTRL_C = 3;
+const KEY_H_LOWER = 104;
+const KEY_H_UPPER = 72;
 
 // Thinking visibility state — persists across turns, toggled with 'h'
 let showThinking = true;
@@ -50,8 +54,8 @@ function createAgent() {
     maxTokens: config.agent.maxTokens,
   });
   const tools = new ToolRegistry();
-  registerBasicTools(tools);
-  return { llm, tools };
+  registerBasicTools(tools, config.memory.dir);
+  return { llm, tools, config };
 }
 
 /**
@@ -64,12 +68,12 @@ function startHotkeyListener(): () => void {
 
   const onData = (key: Buffer) => {
     // Ctrl+C — exit
-    if (key[0] === 3) {
+    if (key[0] === KEY_CTRL_C) {
       process.stderr.write(`${RESET}\n`);
       process.exit(0);
     }
     // 'h' or 'H' — toggle thinking
-    if (key[0] === 104 || key[0] === 72) {
+    if (key[0] === KEY_H_LOWER || key[0] === KEY_H_UPPER) {
       showThinking = !showThinking;
       process.stderr.write(
         `\n  ${YELLOW}[thinking ${showThinking ? "visible" : "hidden"} — press h to toggle]${RESET}\n`,
@@ -78,17 +82,24 @@ function startHotkeyListener(): () => void {
   };
 
   process.stdin.setRawMode(true);
-  process.stdin.resume();
+  process.stdin.resume(); // resume stdin — may have been paused by readline
   process.stdin.on("data", onData);
 
   return () => {
     process.stdin.removeListener("data", onData);
-    process.stdin.setRawMode(false);
-    process.stdin.pause();
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+    }
   };
 }
 
-async function ask(input: string, llm: LLMClient, tools: ToolRegistry): Promise<string> {
+async function ask(
+  input: string,
+  llm: LLMClient,
+  tools: ToolRegistry,
+  maxTurns?: number,
+): Promise<string> {
   const messages: ChatMessage[] = [
     { role: "system", content: SYSTEM_PROMPT },
     { role: "user", content: input },
@@ -128,6 +139,7 @@ async function ask(input: string, llm: LLMClient, tools: ToolRegistry): Promise<
           }
         }
       },
+      maxTurns,
     );
 
     if (lastWasThinking && showThinking) {
@@ -141,8 +153,7 @@ async function ask(input: string, llm: LLMClient, tools: ToolRegistry): Promise<
   }
 }
 
-async function repl(llm: LLMClient, tools: ToolRegistry): Promise<void> {
-  const config = loadConfig();
+async function repl(llm: LLMClient, tools: ToolRegistry, config: EphileoConfig): Promise<void> {
   console.log("Ephileo v0.1 — Local AI Agent");
   console.log(`Provider: ${config.provider} (${llm.opts.model})`);
   console.log(`Tools: ${tools.listNames().join(", ")}`);
@@ -169,17 +180,19 @@ async function repl(llm: LLMClient, tools: ToolRegistry): Promise<void> {
       return;
     }
 
-    // Pause readline while agent runs (stdin goes to raw mode for hotkeys)
+    // Show labelled echo of user input
+    process.stderr.write(`  ${GREEN}[user]${RESET} ${input}\n`);
+
+    // Pause readline so it doesn't conflict with raw mode hotkeys
     rl.pause();
 
     try {
-      const response = await ask(input, llm, tools);
+      const response = await ask(input, llm, tools, config.agent.maxTurns);
       console.log(`\n${BLUE}ephileo>${RESET} ${response}\n`);
     } catch (err) {
       console.error(`\n[error] ${err instanceof Error ? err.message : String(err)}\n`);
     }
 
-    // Resume readline for next prompt
     rl.resume();
     rl.prompt();
   });
@@ -191,18 +204,15 @@ async function repl(llm: LLMClient, tools: ToolRegistry): Promise<void> {
 
 const program = new Command();
 
-program
-  .name("ephileo")
-  .description("Ephileo — your local AI agent")
-  .version("0.1.0");
+program.name("ephileo").description("Ephileo — your local AI agent").version("0.1.0");
 
 program
   .command("ask")
   .description("Ask Ephileo a question or give it a task (one-shot)")
   .argument("<input...>", "Your question or task")
   .action(async (inputParts: string[]) => {
-    const { llm, tools } = createAgent();
-    const response = await ask(inputParts.join(" "), llm, tools);
+    const { llm, tools, config } = createAgent();
+    const response = await ask(inputParts.join(" "), llm, tools, config.agent.maxTurns);
     console.log(response);
   });
 
@@ -210,8 +220,8 @@ program
   .command("chat", { isDefault: true })
   .description("Start interactive chat (default)")
   .action(async () => {
-    const { llm, tools } = createAgent();
-    await repl(llm, tools);
+    const { llm, tools, config } = createAgent();
+    await repl(llm, tools, config);
   });
 
 program.parse();
