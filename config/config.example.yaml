@@ -1,0 +1,41 @@
+# Ephileo Configuration
+# Copy this to config.yaml and customize.
+
+# Active provider — which LLM backend to use
+provider: exo
+
+# Provider definitions
+# Add as many as you want; switch by changing "provider" above.
+providers:
+  exo:
+    baseUrl: http://localhost:52415/v1
+    model: mlx-community/Qwen3-30B-A3B-4bit
+    # No API key needed for local
+
+  ollama:
+    baseUrl: http://localhost:11434/v1
+    model: qwen3:30b-a3b
+
+  openrouter:
+    baseUrl: https://openrouter.ai/api/v1
+    model: anthropic/claude-sonnet-4
+    apiKey: sk-or-your-key-here
+
+  gemini:
+    baseUrl: https://generativelanguage.googleapis.com/v1beta/openai
+    model: gemini-2.5-flash
+    apiKey: your-gemini-key-here
+
+  openai:
+    baseUrl: https://api.openai.com/v1
+    model: gpt-4o
+    apiKey: sk-your-key-here
+
+# Agent settings
+agent:
+  maxTurns: 20
+  maxTokens: 4096
+
+# Paths
+memory:
+  dir: ./memory
