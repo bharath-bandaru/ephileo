@@ -5,4 +5,7 @@ __pycache__/
 *.pyc
 .env
 config/config.yaml
-.claude/agents/
+.claude/
+memory/
+.ephileo_history
+.ephileo_settings

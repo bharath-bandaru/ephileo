@@ -5,12 +5,15 @@
  * Add more tools by calling registry.register().
  */
 
-import { execSync } from "node:child_process";
+import { exec } from "node:child_process";
 import { appendFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
+import { promisify } from "node:util";
 import { registerEditTool } from "./edit.js";
 import type { ToolRegistry } from "./registry.js";
+
+const execAsync = promisify(exec);
 
 const MAX_FILE_READ_CHARS = 10_000;
 const MAX_SHELL_OUTPUT_CHARS = 5_000;
@@ -29,6 +32,7 @@ export function registerBasicTools(registry: ToolRegistry, memoryDir: string): v
       },
       required: ["path"],
     },
+    confirmationGroup: "read",
     async handler(args) {
       const p = resolve(String(args.path).replace(/^~/, homedir()));
       const content = await readFile(p, "utf-8");
@@ -50,6 +54,7 @@ export function registerBasicTools(registry: ToolRegistry, memoryDir: string): v
       required: ["path", "content"],
     },
     requiresConfirmation: true,
+    confirmationGroup: "write",
     async handler(args) {
       const p = resolve(String(args.path).replace(/^~/, homedir()));
       await mkdir(dirname(p), { recursive: true });
@@ -68,6 +73,7 @@ export function registerBasicTools(registry: ToolRegistry, memoryDir: string): v
       },
       required: [],
     },
+    confirmationGroup: "read",
     async handler(args) {
       const p = resolve(String(args.path || ".").replace(/^~/, homedir()));
       const entries = await readdir(p);
@@ -90,18 +96,23 @@ export function registerBasicTools(registry: ToolRegistry, memoryDir: string): v
       },
       required: ["command"],
     },
+    requiresConfirmation: true,
+    confirmationGroup: "read",
     async handler(args) {
       try {
-        const output = execSync(String(args.command), {
+        const { stdout } = await execAsync(String(args.command), {
           timeout: SHELL_TIMEOUT_MS,
           encoding: "utf-8",
-          stdio: ["pipe", "pipe", "pipe"],
         });
-        return output.slice(0, MAX_SHELL_OUTPUT_CHARS) || "(no output)";
+        return stdout.slice(0, MAX_SHELL_OUTPUT_CHARS) || "(no output)";
       } catch (err: unknown) {
-        const error = err as { stderr?: string; message?: string };
-        const stderr = error.stderr ?? error.message ?? String(err);
-        return `Error: ${String(stderr).slice(0, MAX_SHELL_ERROR_CHARS)}`;
+        const stderr =
+          err instanceof Error
+            ? err.message
+            : typeof err === "object" && err !== null && "stderr" in err
+              ? String((err as Record<string, unknown>).stderr)
+              : String(err);
+        return `Error: ${stderr.slice(0, MAX_SHELL_ERROR_CHARS)}`;
       }
     },
   });
@@ -118,6 +129,7 @@ export function registerBasicTools(registry: ToolRegistry, memoryDir: string): v
       },
       required: ["topic", "content"],
     },
+    confirmationGroup: "none",
     async handler(args) {
       await mkdir(memoryDir, { recursive: true });
       const journal = resolve(memoryDir, "learnings.md");

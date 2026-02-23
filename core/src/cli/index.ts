@@ -8,30 +8,30 @@
  *   pnpm dev -- ask "what time is it" # one-shot question
  *   pnpm dev -- ask "list my files"   # uses tools automatically
  *
- * Press 'h' while the agent is thinking to toggle thinking visibility.
+ * Press 't' while the agent is thinking to toggle thinking visibility.
+ * Press Escape to cancel the current operation and return to the prompt.
  */
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Command } from "commander";
-import { buildSystemPrompt, runAgentLoop } from "../agent/index.js";
+import { buildSystemPrompt } from "../agent/index.js";
 import { type EphileoConfig, getActiveProvider, loadConfig } from "../config/loader.js";
 import { type ChatMessage, LLMClient } from "../llm/index.js";
+import type { PermissionLevel } from "../tools/index.js";
 import { registerBasicTools, ToolRegistry } from "../tools/index.js";
+import { BLUE, DIM, GREEN, RED, RESET, YELLOW } from "./ansi.js";
+import { ask, clearTrackedOutput, createTrackedWriter } from "./ask.js";
+import { CommandRegistry } from "./commands.js";
+import { askConfirmation } from "./confirm.js";
+import { appendHistory, loadHistory } from "./history.js";
 import { readMultiLineInput } from "./input.js";
-
-// ANSI codes
-const DIM = "\x1b[2m";
-const RED = "\x1b[31m";
-const GREEN = "\x1b[32m";
-const BLUE = "\x1b[34m";
-const YELLOW = "\x1b[33m";
-const RESET = "\x1b[0m";
-
-// Key codes for hotkey detection
-const KEY_CTRL_C = 3;
-const KEY_H_LOWER = 104;
-const KEY_H_UPPER = 72;
+import {
+  handlePermissionsCommand,
+  PERMISSION_MENU_LINE_COUNT,
+  promptPermissionLevel,
+} from "./permissions.js";
+import { loadSettings, saveSettings } from "./settings.js";
 
 // Spinner animation frames and timing
 const SPINNER_FRAMES = [
@@ -47,20 +47,6 @@ const SPINNER_FRAMES = [
   "\u280F",
 ];
 const SPINNER_INTERVAL_MS = 80;
-
-// Thinking visibility state — persists across turns, toggled with 'h'
-let showThinking = true;
-
-interface AskResult {
-  response: string;
-  hadThinking: boolean;
-}
-
-interface AskOptions {
-  maxTurns?: number;
-  /** Suppress [turn] logs and thinking display (used for init call). */
-  silent?: boolean;
-}
 
 function formatError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
@@ -90,47 +76,12 @@ function createAgent() {
     });
     const tools = new ToolRegistry();
     registerBasicTools(tools, config.memory.dir);
+    tools.setConfirmationCallback(askConfirmation);
     return { llm, tools, config };
   } catch (err: unknown) {
     console.error(`\n${formatError(err)}\n`);
     process.exit(1);
   }
-}
-
-/**
- * Listen for 'h' keypress while the agent is running.
- * Switches stdin to raw mode so we can catch individual keys without Enter.
- * Returns a cleanup function to restore normal mode.
- */
-function startHotkeyListener(): () => void {
-  if (!process.stdin.isTTY) return () => {};
-
-  const onData = (key: Buffer) => {
-    // Ctrl+C — exit
-    if (key[0] === KEY_CTRL_C) {
-      process.stderr.write(`${RESET}\n`);
-      process.exit(0);
-    }
-    // 'h' or 'H' — toggle thinking
-    if (key[0] === KEY_H_LOWER || key[0] === KEY_H_UPPER) {
-      showThinking = !showThinking;
-      process.stderr.write(
-        `\n  ${YELLOW}[thinking ${showThinking ? "visible" : "hidden"} — press h to toggle]${RESET}\n`,
-      );
-    }
-  };
-
-  process.stdin.setRawMode(true);
-  process.stdin.resume(); // resume stdin — may have been paused by readline
-  process.stdin.on("data", onData);
-
-  return () => {
-    process.stdin.removeListener("data", onData);
-    if (process.stdin.isTTY) {
-      process.stdin.setRawMode(false);
-      process.stdin.pause();
-    }
-  };
 }
 
 /** Animated spinner for long-running silent operations. Returns a stop function. */
@@ -148,108 +99,100 @@ function startSpinner(message: string): () => void {
   };
 }
 
-async function ask(
-  input: string,
-  llm: LLMClient,
-  tools: ToolRegistry,
-  systemPrompt: string,
-  opts: AskOptions = {},
-): Promise<AskResult> {
-  const { maxTurns, silent = false } = opts;
-  const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: input },
-  ];
-
-  let lastWasThinking = false;
-  let detectedThinking = false;
-
-  // Start listening for 'h' hotkey during agent execution
-  const stopHotkeys = startHotkeyListener();
-
-  try {
-    const result = await runAgentLoop(
-      messages,
-      llm,
-      tools,
-      // Log function for turn/tool events
-      (msg) => {
-        if (silent) return;
-        if (lastWasThinking) {
-          process.stderr.write(`${RESET}\n`);
-          lastWasThinking = false;
-        }
-        process.stderr.write(`  ${GREEN}${msg}${RESET}\n`);
-      },
-      // Live streaming callback — always tracks thinking, only displays when not silent
-      (token, isThinking) => {
-        if (isThinking) {
-          detectedThinking = true;
-          if (!silent && showThinking) {
-            process.stderr.write(`${DIM}${token}${RESET}`);
-          }
-          lastWasThinking = !silent;
-        } else {
-          if (lastWasThinking) {
-            if (showThinking) {
-              process.stderr.write(`${RESET}\n`);
-            }
-            lastWasThinking = false;
-          }
-        }
-      },
-      maxTurns,
-    );
-
-    if (lastWasThinking && showThinking) {
-      process.stderr.write(`${RESET}\n`);
-    }
-
-    return { response: result.response, hadThinking: detectedThinking };
-  } finally {
-    // Restore stdin so the input handler can use it
-    stopHotkeys();
-  }
-}
-
 async function repl(llm: LLMClient, tools: ToolRegistry, config: EphileoConfig): Promise<void> {
-  console.log("Ephileo v0.1 — Local AI Agent");
+  console.log(`\n${YELLOW}Ephileo v0.1${RESET} — your local AI agent\n`);
   console.log(`Provider: ${config.provider} (${llm.opts.model})`);
-  console.log(`Tools: ${tools.listNames().join(", ")}`);
+  console.log(`Tools: ${tools.listNames().join(", ")}\n`);
 
+  // Load saved permission level or prompt on first run
+  const settings = loadSettings();
+  let permissionLevel: PermissionLevel;
+  if (settings.permissionLevel) {
+    permissionLevel = settings.permissionLevel;
+  } else {
+    permissionLevel = await promptPermissionLevel();
+    saveSettings({ permissionLevel });
+    // Clear the permission menu lines (cursor is on a new line after user's keypress)
+    let clearMenu = "\x1b[2K";
+    for (let i = 0; i < PERMISSION_MENU_LINE_COUNT; i++) {
+      clearMenu += "\x1b[1A\x1b[2K";
+    }
+    clearMenu += "\x1b[G";
+    process.stderr.write(clearMenu);
+  }
+  tools.setPermissionLevel(permissionLevel);
+  console.log(`${DIM}Tip: use / for more options or any preference changes${RESET}\n`);
+
+  // Slash command registry — extensible for future commands
+  const commands = new CommandRegistry();
+  commands.register("permissions", "View or change permission level", async () => {
+    permissionLevel = await handlePermissionsCommand(permissionLevel);
+    tools.setPermissionLevel(permissionLevel);
+    saveSettings({ permissionLevel });
+    return { handled: true };
+  });
+  commands.register("help", "Show available commands", async () => {
+    return { handled: true, message: commands.formatHelp() };
+  });
   // Initial LLM call — detects thinking support and greets/asks name (silent: no logs/thinking)
   const stopSpinner = startSpinner("waking ephileo...");
   const memory = loadMemory(config.memory.dir);
   const systemPrompt = buildSystemPrompt(memory);
+  // Shared conversation history for the session — persists across REPL turns
+  const conversationMessages: ChatMessage[] = [{ role: "system", content: systemPrompt }];
+
+  // Register commands that need access to conversation state
+  commands.register("quit", "Exit Ephileo", async () => {
+    console.log("Goodbye.");
+    process.exit(0);
+  });
+  commands.register("clear", "Clear chat and start fresh", async () => {
+    conversationMessages.length = 1;
+    process.stderr.write("\x1b[2J\x1b[H");
+    return { handled: true, message: `${DIM}Chat cleared.${RESET}` };
+  });
   let greeting: string;
-  let hadThinking: boolean;
   try {
     const result = await ask("Hello! Introduce yourself briefly.", llm, tools, systemPrompt, {
       maxTurns: config.agent.maxTurns,
       silent: true,
+      onFirstThinkingDisplay: () => {
+        // Stop the spinner animation but keep "waking ephileo..." on screen
+        stopSpinner();
+        process.stderr.write("waking ephileo... ok, I am still waking up _'o'- \n");
+      },
     });
     greeting = result.response;
-    hadThinking = result.hadThinking;
   } catch (err: unknown) {
     stopSpinner();
     console.error(`\n${formatError(err)}\n`);
     process.exit(1);
   }
   stopSpinner();
-
-  if (hadThinking) {
-    console.log(`Press ${YELLOW}h${RESET} while thinking to toggle thought visibility.`);
-  }
-  console.log("Shift+Enter for new line, Enter to send.");
-  console.log('Type "quit" to exit.\n');
-  console.log(`${BLUE}ephileo>${RESET} ${greeting}\n`);
+  // Clear the "waking ephileo..." line and the blank dots line above
+  process.stderr.write("\x1b[2K\x1b[1A\x1b[2K\x1b[G");
+  console.log(`${BLUE}ok, I am here for you!${RESET}\n`);
+  console.log(
+    `${GREEN}Tip: Use [\\ and Enter] or [Alt + Enter] for new line, Enter to send.${RESET}`,
+  );
+  console.log(`${DIM}Type /help for commands, /quit to exit.${RESET}\n`);
+  console.log(`${BLUE}ephileo.${RESET} ${greeting}\n`);
 
   const prompt = `${BLUE}> ${RESET}`;
   const continuationPrompt = `${BLUE}..${RESET} `;
 
+  // Command history — stored in .ephileo_history at project root
+  const historyFile = resolve(process.cwd(), ".ephileo_history");
+  const history = loadHistory(historyFile);
+
   // Main REPL loop — each iteration reads one multi-line input
   for (;;) {
-    const result = await readMultiLineInput({ prompt, continuationPrompt });
+    const result = await readMultiLineInput({
+      prompt,
+      continuationPrompt,
+      history,
+      completionProvider: () => commands.getCompletions(),
+    });
 
     if (result.kind === "eof") {
       console.log("Goodbye.");
@@ -259,23 +202,46 @@ async function repl(llm: LLMClient, tools: ToolRegistry, config: EphileoConfig):
     const input = result.value.trim();
     if (!input) continue;
 
-    if (input.toLowerCase() === "quit" || input.toLowerCase() === "exit") {
-      console.log("Goodbye.");
-      process.exit(0);
+    // Slash commands — handled before saving to history or sending to LLM
+    if (input.startsWith("/")) {
+      const cmdResult = await commands.dispatch(input);
+      if (cmdResult?.handled) {
+        if (cmdResult.message) console.log(`\n${cmdResult.message}\n`);
+        continue;
+      }
     }
 
+    // Save to history and keep in-memory list in sync
+    appendHistory(historyFile, input);
+    history.push(input);
+
+    // Track intermediate output lines so we can clear them after the response
+    const { write, counter } = createTrackedWriter();
+
+    write(`  ${DIM}press t to show/hide thinking${RESET}\n`);
     // Show labelled echo of user input (replace newlines for compact display)
     const displayInput = input.includes("\n") ? input.replace(/\n/g, " \\n ") : input;
-    process.stderr.write(`  ${GREEN}[user]${RESET} ${displayInput}\n`);
+    write(`  ${GREEN}[user]${RESET} ${displayInput}\n`);
 
     try {
       const freshMemory = loadMemory(config.memory.dir);
       const freshPrompt = buildSystemPrompt(freshMemory);
-      const { response } = await ask(input, llm, tools, freshPrompt, {
+      // Refresh the system prompt in-place so memory updates take effect each turn
+      conversationMessages[0] = { role: "system", content: freshPrompt };
+      const { response, cancelled } = await ask(input, llm, tools, freshPrompt, {
         maxTurns: config.agent.maxTurns,
+        messages: conversationMessages,
+        write,
       });
-      console.log(`\n${BLUE}ephileo>${RESET} ${response}\n`);
+      // Move cursor up past all intermediate output and clear it
+      clearTrackedOutput(counter);
+      if (cancelled) {
+        console.log(`\n${DIM}[cancelled]${RESET}\n`);
+      } else {
+        console.log(`\n${BLUE}ephileo.${RESET} ${response}\n`);
+      }
     } catch (err: unknown) {
+      // Keep intermediate output visible on error — useful for debugging
       console.error(`\n${formatError(err)}\n`);
     }
   }

@@ -1,140 +1,235 @@
 /**
  * Multi-line raw-mode input handler for the Ephileo REPL.
  *
- * Reads stdin character by character in raw mode. Shift+Enter inserts a
- * newline (continuation), plain Enter submits the accumulated input.
- *
- * Shift+Enter detection relies on escape sequences emitted by modern
- * terminals (kitty keyboard protocol, iTerm2, WezTerm, etc.).
+ * Supports:
+ * - Cursor movement with arrow keys (left/right within line, up/down across lines)
+ * - Command history navigation with up/down on first/last line
+ * - Shift+Enter or backslash-Enter for multi-line continuation
+ * - Backspace at cursor position (joins lines when at column 0)
+ * - Slash command autocomplete with arrow-key menu navigation
  */
 
 import type { Readable, Writable } from "node:stream";
+import {
+  type AutocompleteState,
+  type CompletionItem,
+  clearMenu,
+  createAutocomplete,
+  getSelectedItem,
+  moveSelection,
+  renderMenu,
+  updateFilter,
+} from "./autocomplete.js";
+import {
+  type ArrowDirection,
+  getArrowDirection,
+  isBackspace,
+  isCtrlC,
+  isCtrlD,
+  isEscape,
+  isPlainEnter,
+  isShiftEnter,
+  isTab,
+  isUnhandledEscape,
+} from "./input-keys.js";
+import {
+  ANSI_MOVE_DOWN,
+  ANSI_MOVE_UP,
+  moveCursorToCol,
+  redrawLine,
+  visualLength,
+} from "./input-rendering.js";
 
-// --- ANSI escape sequences ------------------------------------------------
-
-const ANSI_CLEAR_LINE = "\x1b[2K";
-const ANSI_MOVE_TO_COL_1 = "\r";
-
-// --- Key byte constants ---------------------------------------------------
-
-const BYTE_CTRL_C = 3;
-const BYTE_CTRL_D = 4;
-const BYTE_BACKSPACE = 127;
-const BYTE_CARRIAGE_RETURN = 13;
-const BYTE_NEWLINE = 10;
-const BYTE_ESCAPE = 27;
-
-// --- Shift+Enter escape sequence patterns ---------------------------------
-
-/** Kitty keyboard protocol: ESC [ 13 ; 2 u */
-const KITTY_SHIFT_ENTER = "\x1b[13;2u";
-
-// --- Public types ---------------------------------------------------------
+// --- Public types ----------------------------------------------------------
 
 interface MultiLineInputOptions {
   /** Primary prompt string (e.g. "> "). */
   prompt: string;
   /** Continuation prompt for subsequent lines (e.g. ".. "). */
   continuationPrompt: string;
+  /** Previously entered commands for history navigation. */
+  history?: string[];
   /** Readable stream to read from (defaults to process.stdin). */
   input?: Readable & { isTTY?: boolean; setRawMode?: (mode: boolean) => void };
   /** Writable stream to write to (defaults to process.stderr). */
   output?: Writable;
+  /** Callback that returns available slash command completions. */
+  completionProvider?: () => CompletionItem[];
 }
 
 type InputResult = { kind: "input"; value: string } | { kind: "eof" };
 
-// --- Escape sequence classification ---------------------------------------
+// --- Cursor state ----------------------------------------------------------
 
-/**
- * Determines whether a raw data chunk represents a Shift+Enter sequence.
- *
- * Recognized sequences:
- * - Kitty protocol: `\x1b[13;2u`
- * - Alt+Enter style: `\x1b\r` or `\x1b\n`
- */
-function isShiftEnter(data: Buffer): boolean {
-  const str = data.toString("utf-8");
+interface CursorState {
+  lines: string[];
+  row: number;
+  col: number;
+}
 
-  // Kitty keyboard protocol
-  if (str === KITTY_SHIFT_ENTER) return true;
+function currentPrompt(state: CursorState, promptStr: string, contPrompt: string): string {
+  return state.row === 0 ? promptStr : contPrompt;
+}
 
-  // ESC followed by carriage return or newline (Alt+Enter in many terminals)
-  const ESC_CR_LENGTH = 2;
-  if (data.length === ESC_CR_LENGTH && data[0] === BYTE_ESCAPE) {
-    return data[1] === BYTE_CARRIAGE_RETURN || data[1] === BYTE_NEWLINE;
+// --- Arrow key handlers ----------------------------------------------------
+
+function handleArrowLeft(state: CursorState): void {
+  if (state.col > 0) {
+    state.col--;
   }
+}
 
+function handleArrowRight(state: CursorState): void {
+  if (state.col < state.lines[state.row].length) {
+    state.col++;
+  }
+}
+
+/** Returns true if this was a cursor move (not a history navigation). */
+function handleArrowUp(state: CursorState): boolean {
+  if (state.row > 0) {
+    state.row--;
+    state.col = Math.min(state.col, state.lines[state.row].length);
+    return true;
+  }
   return false;
 }
 
-/**
- * Determines whether a raw data chunk is a plain Enter keypress.
- */
-function isPlainEnter(data: Buffer): boolean {
-  return data.length === 1 && (data[0] === BYTE_CARRIAGE_RETURN || data[0] === BYTE_NEWLINE);
+/** Returns true if this was a cursor move (not a history navigation). */
+function handleArrowDown(state: CursorState): boolean {
+  if (state.row < state.lines.length - 1) {
+    state.row++;
+    state.col = Math.min(state.col, state.lines[state.row].length);
+    return true;
+  }
+  return false;
 }
 
-/**
- * Determines whether a raw data chunk is a backspace keypress.
- */
-function isBackspace(data: Buffer): boolean {
-  return data.length === 1 && data[0] === BYTE_BACKSPACE;
+// --- History navigation ----------------------------------------------------
+
+interface HistoryState {
+  entries: string[];
+  /** Index into entries. Equal to entries.length means "current draft". */
+  index: number;
+  /** Saved draft text when browsing history. */
+  draft: string;
 }
 
-/**
- * Determines whether a raw data chunk is Ctrl+C.
- */
-function isCtrlC(data: Buffer): boolean {
-  return data.length === 1 && data[0] === BYTE_CTRL_C;
+function historyUp(hState: HistoryState, cursor: CursorState): boolean {
+  if (hState.entries.length === 0 || hState.index <= 0) return false;
+
+  // Save draft on first navigation away from current input
+  if (hState.index === hState.entries.length) {
+    hState.draft = cursor.lines.join("\n");
+  }
+
+  hState.index--;
+  const entry = hState.entries[hState.index];
+  const newLines = entry.split("\n");
+  cursor.lines = newLines;
+  cursor.row = 0;
+  cursor.col = newLines[0].length;
+  return true;
 }
 
-/**
- * Determines whether a raw data chunk is Ctrl+D (EOF).
- */
-function isCtrlD(data: Buffer): boolean {
-  return data.length === 1 && data[0] === BYTE_CTRL_D;
+function historyDown(hState: HistoryState, cursor: CursorState): boolean {
+  if (hState.index >= hState.entries.length) return false;
+
+  hState.index++;
+  const text = hState.index === hState.entries.length ? hState.draft : hState.entries[hState.index];
+  const newLines = text.split("\n");
+  cursor.lines = newLines;
+  cursor.row = newLines.length - 1;
+  cursor.col = newLines[cursor.row].length;
+  return true;
 }
 
-/**
- * Determines whether a data chunk is an unrecognized escape sequence
- * (starts with ESC but is not Shift+Enter).
- */
-function isOtherEscapeSequence(data: Buffer): boolean {
-  return data.length > 1 && data[0] === BYTE_ESCAPE && !isShiftEnter(data);
+// --- Full redraw (all lines) -----------------------------------------------
+
+function redrawAllLines(
+  output: Writable,
+  cursor: CursorState,
+  promptStr: string,
+  contPrompt: string,
+): void {
+  // Move up to first line
+  for (let i = cursor.lines.length - 1; i > 0; i--) {
+    output.write(ANSI_MOVE_UP);
+  }
+  // Redraw each line
+  for (let i = 0; i < cursor.lines.length; i++) {
+    const p = i === 0 ? promptStr : contPrompt;
+    redrawLine(output, p, cursor.lines[i]);
+    if (i < cursor.lines.length - 1) {
+      output.write("\n");
+    }
+  }
+  // Move cursor back to the active row
+  for (let i = cursor.lines.length - 1; i > cursor.row; i--) {
+    output.write(ANSI_MOVE_UP);
+  }
+  const p = currentPrompt(cursor, promptStr, contPrompt);
+  moveCursorToCol(output, cursor.col, visualLength(p));
 }
 
-// --- Display helpers ------------------------------------------------------
+// --- Autocomplete helpers --------------------------------------------------
 
-/**
- * Redraws the current line in the terminal, clearing what was there before.
- */
-function redrawCurrentLine(output: Writable, prompt: string, lineContent: string): void {
-  output.write(`${ANSI_MOVE_TO_COL_1}${ANSI_CLEAR_LINE}${prompt}${lineContent}`);
+function shouldShowAutocomplete(cursor: CursorState): boolean {
+  return cursor.lines.length === 1 && cursor.row === 0 && cursor.lines[0].startsWith("/");
 }
 
-// --- Core input function --------------------------------------------------
+function refreshAutocomplete(
+  output: Writable,
+  cursor: CursorState,
+  acRef: { state: AutocompleteState | null },
+  provider: () => CompletionItem[],
+): void {
+  const line = cursor.lines[cursor.row];
+  if (shouldShowAutocomplete(cursor)) {
+    const filter = line.slice(1);
+    if (!acRef.state) {
+      acRef.state = createAutocomplete(provider());
+    }
+    updateFilter(acRef.state, filter);
+    if (acRef.state.filtered.length > 0) {
+      renderMenu(output, acRef.state);
+    } else {
+      clearMenu(output, acRef.state);
+      acRef.state = null;
+    }
+  } else if (acRef.state) {
+    clearMenu(output, acRef.state);
+    acRef.state = null;
+  }
+}
 
-/**
- * Reads a single multi-line input from the user via raw-mode stdin.
- *
- * - Plain Enter submits the full input.
- * - Shift+Enter (or Alt+Enter) inserts a newline continuation.
- * - Backspace deletes the last character (or joins with the previous line).
- * - Ctrl+C exits the process.
- * - Ctrl+D on an empty buffer signals EOF.
- *
- * Returns a promise that resolves with the complete input string, or an
- * EOF signal when the user presses Ctrl+D on an empty line.
- */
+function dismissAutocomplete(output: Writable, acRef: { state: AutocompleteState | null }): void {
+  if (acRef.state) {
+    clearMenu(output, acRef.state);
+    acRef.state = null;
+  }
+}
+
+// --- Core input function ---------------------------------------------------
+
 function readMultiLineInput(options: MultiLineInputOptions): Promise<InputResult> {
-  const { prompt, continuationPrompt, input = process.stdin, output = process.stderr } = options;
+  const {
+    prompt,
+    continuationPrompt,
+    history = [],
+    input = process.stdin,
+    output = process.stderr,
+    completionProvider,
+  } = options;
 
   return new Promise((resolve) => {
-    const lines: string[] = [""];
-
-    const currentLineIndex = (): number => lines.length - 1;
-    const currentPrompt = (): string => (currentLineIndex() === 0 ? prompt : continuationPrompt);
+    const cursor: CursorState = { lines: [""], row: 0, col: 0 };
+    const hState: HistoryState = {
+      entries: history,
+      index: history.length,
+      draft: "",
+    };
+    const acRef: { state: AutocompleteState | null } = { state: null };
 
     // Show the initial prompt
     output.write(prompt);
@@ -146,6 +241,7 @@ function readMultiLineInput(options: MultiLineInputOptions): Promise<InputResult
     input.resume();
 
     const cleanup = () => {
+      dismissAutocomplete(output, acRef);
       input.removeListener("data", onData);
       if (input.isTTY && input.setRawMode) {
         input.setRawMode(false);
@@ -163,75 +259,280 @@ function readMultiLineInput(options: MultiLineInputOptions): Promise<InputResult
 
       // --- Ctrl+D: EOF on empty buffer ---
       if (isCtrlD(data)) {
-        const fullInput = lines.join("\n");
+        const fullInput = cursor.lines.join("\n");
         if (fullInput.length === 0) {
           cleanup();
           output.write("\n");
           resolve({ kind: "eof" });
           return;
         }
-        // Non-empty buffer: ignore Ctrl+D
         return;
+      }
+
+      // --- Escape (standalone): dismiss autocomplete or ignore ---
+      if (isEscape(data)) {
+        dismissAutocomplete(output, acRef);
+        return;
+      }
+
+      // --- Tab: fill autocomplete selection or ignore ---
+      if (isTab(data)) {
+        if (acRef.state) {
+          const selected = getSelectedItem(acRef.state);
+          if (selected) {
+            const value = `/${selected.name}`;
+            cursor.lines[cursor.row] = value;
+            cursor.col = value.length;
+            dismissAutocomplete(output, acRef);
+            const p = currentPrompt(cursor, prompt, continuationPrompt);
+            redrawLine(output, p, value);
+            moveCursorToCol(output, cursor.col, visualLength(p));
+          }
+        }
+        return; // always consume Tab
       }
 
       // --- Shift+Enter: insert newline continuation ---
       if (isShiftEnter(data)) {
-        output.write("\n");
-        lines.push("");
-        output.write(continuationPrompt);
+        dismissAutocomplete(output, acRef);
+        insertNewline(output, cursor, prompt, continuationPrompt);
         return;
       }
 
-      // --- Plain Enter: submit ---
+      // --- Plain Enter ---
       if (isPlainEnter(data)) {
+        // Autocomplete selection: fill and submit
+        if (acRef.state) {
+          const selected = getSelectedItem(acRef.state);
+          if (selected) {
+            const value = `/${selected.name}`;
+            cursor.lines = [value];
+            cursor.col = value.length;
+            dismissAutocomplete(output, acRef);
+            const p = currentPrompt(cursor, prompt, continuationPrompt);
+            redrawLine(output, p, value);
+            cleanup();
+            output.write("\n");
+            resolve({ kind: "input", value });
+            return;
+          }
+        }
+
+        const line = cursor.lines[cursor.row];
+        // Backslash at end of line → continuation
+        if (line.endsWith("\\")) {
+          cursor.lines[cursor.row] = line.slice(0, -1);
+          const p = currentPrompt(cursor, prompt, continuationPrompt);
+          redrawLine(output, p, cursor.lines[cursor.row]);
+          insertNewline(output, cursor, prompt, continuationPrompt);
+          return;
+        }
+        // Move cursor to end of last line for clean newline display
+        if (cursor.row < cursor.lines.length - 1) {
+          for (let i = cursor.row; i < cursor.lines.length - 1; i++) {
+            output.write("\x1b[B"); // move down
+          }
+        }
         cleanup();
         output.write("\n");
-        resolve({ kind: "input", value: lines.join("\n") });
+        resolve({ kind: "input", value: cursor.lines.join("\n") });
+        return;
+      }
+
+      // --- Arrow keys ---
+      const arrow = getArrowDirection(data);
+      if (arrow) {
+        // Autocomplete navigation: intercept up/down for menu
+        if (acRef.state && (arrow === "up" || arrow === "down")) {
+          moveSelection(acRef.state, arrow);
+          renderMenu(output, acRef.state);
+          return;
+        }
+        handleArrow(arrow, output, cursor, hState, prompt, continuationPrompt);
         return;
       }
 
       // --- Backspace ---
       if (isBackspace(data)) {
-        const idx = currentLineIndex();
-        if (lines[idx].length > 0) {
-          // Delete the last character on the current line
-          lines[idx] = lines[idx].slice(0, -1);
-          redrawCurrentLine(output, currentPrompt(), lines[idx]);
-        } else if (idx > 0) {
-          // Current line is empty — join with the previous line
-          lines.pop();
-          const prevIdx = currentLineIndex();
-          // Move cursor up and redraw the previous line
-          output.write("\x1b[A");
-          redrawCurrentLine(output, currentPrompt(), lines[prevIdx]);
+        handleBackspace(output, cursor, prompt, continuationPrompt);
+        if (completionProvider) {
+          refreshAutocomplete(output, cursor, acRef, completionProvider);
         }
         return;
       }
 
-      // --- Ignore unrecognized escape sequences (arrow keys, etc.) ---
-      if (isOtherEscapeSequence(data)) {
+      // --- Ignore unrecognized escape sequences ---
+      if (isUnhandledEscape(data)) {
         return;
       }
 
-      // --- Regular printable character ---
+      // --- Regular printable character (insert at cursor) ---
       const text = data.toString("utf-8");
-      const idx = currentLineIndex();
-      lines[idx] += text;
-      output.write(text);
+      const line = cursor.lines[cursor.row];
+      cursor.lines[cursor.row] = line.slice(0, cursor.col) + text + line.slice(cursor.col);
+      cursor.col += text.length;
+
+      const p = currentPrompt(cursor, prompt, continuationPrompt);
+      redrawLine(output, p, cursor.lines[cursor.row]);
+      moveCursorToCol(output, cursor.col, visualLength(p));
+
+      // Update autocomplete after character insertion
+      if (completionProvider) {
+        refreshAutocomplete(output, cursor, acRef, completionProvider);
+      }
     };
 
     input.on("data", onData);
   });
 }
 
-export {
-  isBackspace,
-  isCtrlC,
-  isCtrlD,
-  isOtherEscapeSequence,
-  isPlainEnter,
-  isShiftEnter,
-  readMultiLineInput,
-  redrawCurrentLine,
-};
-export type { InputResult, MultiLineInputOptions };
+// --- Helper actions --------------------------------------------------------
+
+function insertNewline(
+  output: Writable,
+  cursor: CursorState,
+  promptStr: string,
+  contPrompt: string,
+): void {
+  // Split the current line at cursor position
+  const before = cursor.lines[cursor.row].slice(0, cursor.col);
+  const after = cursor.lines[cursor.row].slice(cursor.col);
+  cursor.lines[cursor.row] = before;
+  cursor.lines.splice(cursor.row + 1, 0, after);
+  cursor.row++;
+  cursor.col = 0;
+
+  // Redraw: clear rest of current line, then draw new lines below
+  const p = currentPrompt({ ...cursor, row: cursor.row - 1 }, promptStr, contPrompt);
+  redrawLine(output, p, before);
+  output.write("\n");
+
+  // Redraw all lines from cursor.row onward
+  for (let i = cursor.row; i < cursor.lines.length; i++) {
+    const linePrompt = i === 0 ? promptStr : contPrompt;
+    redrawLine(output, linePrompt, cursor.lines[i]);
+    if (i < cursor.lines.length - 1) {
+      output.write("\n");
+    }
+  }
+
+  // Move cursor back up to the active row
+  for (let i = cursor.lines.length - 1; i > cursor.row; i--) {
+    output.write(ANSI_MOVE_UP);
+  }
+  moveCursorToCol(output, cursor.col, visualLength(contPrompt));
+}
+
+function handleBackspace(
+  output: Writable,
+  cursor: CursorState,
+  promptStr: string,
+  contPrompt: string,
+): void {
+  if (cursor.col > 0) {
+    // Delete character before cursor
+    const line = cursor.lines[cursor.row];
+    cursor.lines[cursor.row] = line.slice(0, cursor.col - 1) + line.slice(cursor.col);
+    cursor.col--;
+    const p = currentPrompt(cursor, promptStr, contPrompt);
+    redrawLine(output, p, cursor.lines[cursor.row]);
+    moveCursorToCol(output, cursor.col, visualLength(p));
+  } else if (cursor.row > 0) {
+    // At column 0 — join with previous line
+    const currentLine = cursor.lines[cursor.row];
+    cursor.lines.splice(cursor.row, 1);
+    cursor.row--;
+    cursor.col = cursor.lines[cursor.row].length;
+    cursor.lines[cursor.row] += currentLine;
+
+    // Move up and redraw from current row downward
+    output.write(ANSI_MOVE_UP);
+    for (let i = cursor.row; i < cursor.lines.length; i++) {
+      const p = i === 0 ? promptStr : contPrompt;
+      redrawLine(output, p, cursor.lines[i]);
+      if (i < cursor.lines.length - 1) {
+        output.write("\n");
+      }
+    }
+    // Clear the now-empty last visual line
+    output.write("\n");
+    redrawLine(output, "", "");
+
+    // Move back up to cursor row
+    const linesBelow = cursor.lines.length - cursor.row;
+    for (let i = 0; i < linesBelow; i++) {
+      output.write(ANSI_MOVE_UP);
+    }
+    const p = currentPrompt(cursor, promptStr, contPrompt);
+    moveCursorToCol(output, cursor.col, visualLength(p));
+  }
+}
+
+function handleArrow(
+  direction: ArrowDirection,
+  output: Writable,
+  cursor: CursorState,
+  hState: HistoryState,
+  promptStr: string,
+  contPrompt: string,
+): void {
+  switch (direction) {
+    case "left": {
+      handleArrowLeft(cursor);
+      const p = currentPrompt(cursor, promptStr, contPrompt);
+      moveCursorToCol(output, cursor.col, visualLength(p));
+      return;
+    }
+    case "right": {
+      handleArrowRight(cursor);
+      const p = currentPrompt(cursor, promptStr, contPrompt);
+      moveCursorToCol(output, cursor.col, visualLength(p));
+      return;
+    }
+    case "up": {
+      // Try to move the cursor up within the multi-line buffer first.
+      const moved = handleArrowUp(cursor);
+      if (moved) {
+        // Terminal cursor physically moves up one row, then we reposition column.
+        output.write(ANSI_MOVE_UP);
+        const p = currentPrompt(cursor, promptStr, contPrompt);
+        moveCursorToCol(output, cursor.col, visualLength(p));
+        return;
+      }
+      // Already on the first row — try history navigation.
+      const oldLineCount = cursor.lines.length;
+      if (historyUp(hState, cursor)) {
+        for (let i = oldLineCount - 1; i > 0; i--) {
+          output.write(ANSI_MOVE_UP);
+        }
+        redrawAllLines(output, cursor, promptStr, contPrompt);
+      }
+      // At top of history with no movement — do nothing (cursor stays put).
+      return;
+    }
+    case "down": {
+      // Try to move the cursor down within the multi-line buffer first.
+      const moved = handleArrowDown(cursor);
+      if (moved) {
+        // Terminal cursor physically moves down one row, then we reposition column.
+        output.write(ANSI_MOVE_DOWN);
+        const p = currentPrompt(cursor, promptStr, contPrompt);
+        moveCursorToCol(output, cursor.col, visualLength(p));
+        return;
+      }
+      // Already on the last row — try history navigation.
+      const oldLineCount = cursor.lines.length;
+      if (historyDown(hState, cursor)) {
+        for (let i = oldLineCount - 1; i > 0; i--) {
+          output.write(ANSI_MOVE_UP);
+        }
+        redrawAllLines(output, cursor, promptStr, contPrompt);
+      }
+      // At bottom of history with no movement — do nothing (cursor stays put).
+      return;
+    }
+  }
+}
+
+export { readMultiLineInput, redrawLine, visualLength };
+export type { CompletionItem, CursorState, HistoryState, InputResult, MultiLineInputOptions };

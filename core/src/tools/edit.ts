@@ -102,6 +102,7 @@ export function registerEditTool(registry: ToolRegistry): void {
       required: ["path", "old_string", "new_string"],
     },
     requiresConfirmation: true,
+    confirmationGroup: "write",
     async handler(args) {
       const p = resolve(String(args.path).replace(/^~/, homedir()));
       const oldString = String(args.old_string);

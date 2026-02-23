@@ -8,6 +8,8 @@
  * lets the caller display them live as they arrive.
  */
 
+import { UserAbortError } from "../errors.js";
+
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
@@ -92,11 +94,15 @@ export class LLMClient {
    * Tokens arrive one at a time via SSE. The onToken callback fires for each
    * token so you can display them live in the terminal. At the end, the full
    * parsed LLMResponse is returned (same shape as before).
+   *
+   * Pass an AbortSignal to allow the caller to cancel mid-stream.
+   * On abort, throws UserAbortError with any partial content accumulated so far.
    */
   async chat(
     messages: ChatMessage[],
     tools?: ToolDefinition[],
     onToken?: OnTokenCallback,
+    signal?: AbortSignal,
   ): Promise<LLMResponse> {
     const payload: Record<string, unknown> = {
       model: this.opts.model,
@@ -113,15 +119,20 @@ export class LLMClient {
       headers.Authorization = `Bearer ${this.opts.apiKey}`;
     }
 
+    // Combine user-supplied abort signal with the timeout signal
+    const timeoutSignal = AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS);
+    const combinedSignal = signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal;
+
     let resp: Response;
     try {
       resp = await fetch(`${this.opts.baseUrl}/chat/completions`, {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
+        signal: combinedSignal,
       });
     } catch (err: unknown) {
+      if (signal?.aborted) throw new UserAbortError();
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
         throw new Error(
@@ -163,8 +174,16 @@ export class LLMClient {
     let sseBuffer = "";
 
     while (true) {
-      const { done, value } = await reader.read();
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+      try {
+        readResult = await reader.read();
+      } catch {
+        if (signal?.aborted) throw new UserAbortError("Operation cancelled by user", fullContent);
+        throw new Error("Stream read failed");
+      }
+      const { done, value } = readResult;
       if (done) break;
+      if (signal?.aborted) throw new UserAbortError("Operation cancelled by user", fullContent);
 
       sseBuffer += decoder.decode(value, { stream: true });
 

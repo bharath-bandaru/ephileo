@@ -11,6 +11,7 @@
  * The caller (CLI, daemon, API) manages state/persistence.
  */
 
+import { UserAbortError } from "../errors.js";
 import type { ChatMessage, LLMClient, OnTokenCallback } from "../llm/index.js";
 import type { ToolRegistry } from "../tools/index.js";
 
@@ -32,13 +33,14 @@ export async function runAgentLoop(
   log: LogFn = () => {},
   onToken?: OnTokenCallback,
   maxTurns: number = MAX_TURNS,
+  signal?: AbortSignal,
 ): Promise<AgentResult> {
   const schemas = tools.getSchemas();
   const toolsUsed: string[] = [];
 
   for (let turn = 0; turn < maxTurns; turn++) {
     log(`[turn ${turn + 1}]`);
-    const response = await llm.chat(messages, schemas, onToken);
+    const response = await llm.chat(messages, schemas, onToken, signal);
 
     // No tool calls = final answer
     if (response.toolCalls.length === 0) {
@@ -66,6 +68,7 @@ export async function runAgentLoop(
 
     // Execute each tool call and add results
     for (const tc of response.toolCalls) {
+      if (signal?.aborted) throw new UserAbortError();
       const argsPreview = JSON.stringify(tc.arguments).slice(0, TOOL_ARGS_PREVIEW_LENGTH);
       log(`[tool] ${tc.name}(${argsPreview})`);
       toolsUsed.push(tc.name);

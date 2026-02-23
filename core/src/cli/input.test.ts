@@ -1,122 +1,6 @@
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
-import {
-  isBackspace,
-  isCtrlC,
-  isCtrlD,
-  isOtherEscapeSequence,
-  isPlainEnter,
-  isShiftEnter,
-  readMultiLineInput,
-  redrawCurrentLine,
-} from "./input.js";
-
-// ---------------------------------------------------------------------------
-// Key classification unit tests
-// ---------------------------------------------------------------------------
-
-describe("isShiftEnter", () => {
-  it("recognizes kitty keyboard protocol sequence", () => {
-    expect(isShiftEnter(Buffer.from("\x1b[13;2u"))).toBe(true);
-  });
-
-  it("recognizes ESC + carriage return", () => {
-    expect(isShiftEnter(Buffer.from([0x1b, 0x0d]))).toBe(true);
-  });
-
-  it("recognizes ESC + newline", () => {
-    expect(isShiftEnter(Buffer.from([0x1b, 0x0a]))).toBe(true);
-  });
-
-  it("rejects plain Enter", () => {
-    expect(isShiftEnter(Buffer.from([0x0d]))).toBe(false);
-  });
-
-  it("rejects other escape sequences", () => {
-    expect(isShiftEnter(Buffer.from("\x1b[A"))).toBe(false);
-  });
-});
-
-describe("isPlainEnter", () => {
-  it("recognizes carriage return", () => {
-    expect(isPlainEnter(Buffer.from([0x0d]))).toBe(true);
-  });
-
-  it("recognizes newline", () => {
-    expect(isPlainEnter(Buffer.from([0x0a]))).toBe(true);
-  });
-
-  it("rejects multi-byte sequences", () => {
-    expect(isPlainEnter(Buffer.from([0x0d, 0x0a]))).toBe(false);
-  });
-});
-
-describe("isBackspace", () => {
-  it("recognizes DEL byte (127)", () => {
-    expect(isBackspace(Buffer.from([0x7f]))).toBe(true);
-  });
-
-  it("rejects regular characters", () => {
-    expect(isBackspace(Buffer.from("a"))).toBe(false);
-  });
-});
-
-describe("isCtrlC", () => {
-  it("recognizes byte 3", () => {
-    expect(isCtrlC(Buffer.from([0x03]))).toBe(true);
-  });
-
-  it("rejects other control bytes", () => {
-    expect(isCtrlC(Buffer.from([0x04]))).toBe(false);
-  });
-});
-
-describe("isCtrlD", () => {
-  it("recognizes byte 4", () => {
-    expect(isCtrlD(Buffer.from([0x04]))).toBe(true);
-  });
-
-  it("rejects byte 3", () => {
-    expect(isCtrlD(Buffer.from([0x03]))).toBe(false);
-  });
-});
-
-describe("isOtherEscapeSequence", () => {
-  it("recognizes arrow key up", () => {
-    expect(isOtherEscapeSequence(Buffer.from("\x1b[A"))).toBe(true);
-  });
-
-  it("does not match Shift+Enter (kitty)", () => {
-    expect(isOtherEscapeSequence(Buffer.from("\x1b[13;2u"))).toBe(false);
-  });
-
-  it("does not match single bytes", () => {
-    expect(isOtherEscapeSequence(Buffer.from([0x1b]))).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// redrawCurrentLine
-// ---------------------------------------------------------------------------
-
-describe("redrawCurrentLine", () => {
-  it("writes clear-line then prompt and content", () => {
-    const output = new PassThrough();
-    const chunks: string[] = [];
-    output.on("data", (chunk: Buffer) => chunks.push(chunk.toString("utf-8")));
-
-    redrawCurrentLine(output, "> ", "hello");
-
-    const written = chunks.join("");
-    expect(written).toContain("> hello");
-    // Should contain the clear-line sequence
-    expect(written).toContain("\x1b[2K");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// readMultiLineInput integration-style tests
-// ---------------------------------------------------------------------------
+import { readMultiLineInput, visualLength } from "./input.js";
 
 /** Create a fake TTY-like PassThrough stream. */
 function createMockInput(): PassThrough & { isTTY: boolean; setRawMode: ReturnType<typeof vi.fn> } {
@@ -141,7 +25,6 @@ describe("readMultiLineInput", () => {
       output,
     });
 
-    // Type "hello" then press Enter
     input.write(Buffer.from("hello"));
     input.write(Buffer.from([0x0d]));
 
@@ -160,7 +43,6 @@ describe("readMultiLineInput", () => {
       output,
     });
 
-    // Type "line1", Shift+Enter, "line2", Enter
     input.write(Buffer.from("line1"));
     input.write(Buffer.from("\x1b[13;2u"));
     input.write(Buffer.from("line2"));
@@ -190,6 +72,26 @@ describe("readMultiLineInput", () => {
     expect(result).toEqual({ kind: "input", value: "first\nsecond" });
   });
 
+  it("inserts newline on backslash+Enter continuation", async () => {
+    const input = createMockInput();
+    const output = new PassThrough();
+
+    const resultPromise = readMultiLineInput({
+      prompt: "> ",
+      continuationPrompt: ".. ",
+      input,
+      output,
+    });
+
+    input.write(Buffer.from("hello\\"));
+    input.write(Buffer.from([0x0d])); // backslash+Enter → continuation
+    input.write(Buffer.from("world"));
+    input.write(Buffer.from([0x0d]));
+
+    const result = await resultPromise;
+    expect(result).toEqual({ kind: "input", value: "hello\nworld" });
+  });
+
   it("handles backspace within a single line", async () => {
     const input = createMockInput();
     const output = new PassThrough();
@@ -201,7 +103,6 @@ describe("readMultiLineInput", () => {
       output,
     });
 
-    // Type "helo" -> backspace -> "lo" -> Enter => "helo" without last char = "hel" + "lo"
     input.write(Buffer.from("helo"));
     input.write(Buffer.from([0x7f])); // backspace: "hel"
     input.write(Buffer.from("lo"));
@@ -222,11 +123,9 @@ describe("readMultiLineInput", () => {
       output,
     });
 
-    // Type "abc", Shift+Enter, backspace (empty second line -> join), Enter
     input.write(Buffer.from("abc"));
     input.write(Buffer.from("\x1b[13;2u"));
-    // Second line is empty, backspace should join back to first line
-    input.write(Buffer.from([0x7f]));
+    input.write(Buffer.from([0x7f])); // backspace on empty second line
     input.write(Buffer.from([0x0d]));
 
     const result = await resultPromise;
@@ -244,7 +143,6 @@ describe("readMultiLineInput", () => {
       output,
     });
 
-    // Press Ctrl+D immediately (empty buffer)
     input.write(Buffer.from([0x04]));
 
     const result = await resultPromise;
@@ -262,7 +160,6 @@ describe("readMultiLineInput", () => {
       output,
     });
 
-    // Type "text", Ctrl+D (ignored because buffer not empty), Enter
     input.write(Buffer.from("text"));
     input.write(Buffer.from([0x04]));
     input.write(Buffer.from([0x0d]));
@@ -288,27 +185,6 @@ describe("readMultiLineInput", () => {
     expect(result).toEqual({ kind: "input", value: "" });
   });
 
-  it("ignores unrecognized escape sequences like arrow keys", async () => {
-    const input = createMockInput();
-    const output = new PassThrough();
-
-    const resultPromise = readMultiLineInput({
-      prompt: "> ",
-      continuationPrompt: ".. ",
-      input,
-      output,
-    });
-
-    // Type "ab", arrow up (ignored), "c", Enter
-    input.write(Buffer.from("ab"));
-    input.write(Buffer.from("\x1b[A")); // arrow up — ignored
-    input.write(Buffer.from("c"));
-    input.write(Buffer.from([0x0d]));
-
-    const result = await resultPromise;
-    expect(result).toEqual({ kind: "input", value: "abc" });
-  });
-
   it("enables and disables raw mode on TTY streams", async () => {
     const input = createMockInput();
     const output = new PassThrough();
@@ -320,13 +196,11 @@ describe("readMultiLineInput", () => {
       output,
     });
 
-    // Raw mode should be enabled
     expect(input.setRawMode).toHaveBeenCalledWith(true);
 
     input.write(Buffer.from([0x0d]));
     await resultPromise;
 
-    // Raw mode should be disabled on cleanup
     expect(input.setRawMode).toHaveBeenCalledWith(false);
   });
 
@@ -350,5 +224,240 @@ describe("readMultiLineInput", () => {
 
     const result = await resultPromise;
     expect(result).toEqual({ kind: "input", value: "a\nb\nc" });
+  });
+
+  it("inserts characters at cursor position after left arrow", async () => {
+    const input = createMockInput();
+    const output = new PassThrough();
+
+    const resultPromise = readMultiLineInput({
+      prompt: "> ",
+      continuationPrompt: ".. ",
+      input,
+      output,
+    });
+
+    // Type "ac", left arrow, "b" → "abc"
+    input.write(Buffer.from("ac"));
+    input.write(Buffer.from("\x1b[D")); // left
+    input.write(Buffer.from("b"));
+    input.write(Buffer.from([0x0d]));
+
+    const result = await resultPromise;
+    expect(result).toEqual({ kind: "input", value: "abc" });
+  });
+
+  it("navigates history with up/down arrows", async () => {
+    const input = createMockInput();
+    const output = new PassThrough();
+
+    const resultPromise = readMultiLineInput({
+      prompt: "> ",
+      continuationPrompt: ".. ",
+      history: ["first", "second"],
+      input,
+      output,
+    });
+
+    // Press up twice to get "first", then Enter
+    input.write(Buffer.from("\x1b[A")); // up → "second"
+    input.write(Buffer.from("\x1b[A")); // up → "first"
+    input.write(Buffer.from([0x0d]));
+
+    const result = await resultPromise;
+    expect(result).toEqual({ kind: "input", value: "first" });
+  });
+
+  it("preserves draft when navigating history and returning", async () => {
+    const input = createMockInput();
+    const output = new PassThrough();
+
+    const resultPromise = readMultiLineInput({
+      prompt: "> ",
+      continuationPrompt: ".. ",
+      history: ["old"],
+      input,
+      output,
+    });
+
+    // Type "draft", up (to "old"), down (back to "draft"), Enter
+    input.write(Buffer.from("draft"));
+    input.write(Buffer.from("\x1b[A")); // up → "old"
+    input.write(Buffer.from("\x1b[B")); // down → "draft"
+    input.write(Buffer.from([0x0d]));
+
+    const result = await resultPromise;
+    expect(result).toEqual({ kind: "input", value: "draft" });
+  });
+
+  it("ignores unrecognized escape sequences", async () => {
+    const input = createMockInput();
+    const output = new PassThrough();
+
+    const resultPromise = readMultiLineInput({
+      prompt: "> ",
+      continuationPrompt: ".. ",
+      input,
+      output,
+    });
+
+    input.write(Buffer.from("ab"));
+    input.write(Buffer.from("\x1bOP")); // F1 key — ignored
+    input.write(Buffer.from("c"));
+    input.write(Buffer.from([0x0d]));
+
+    const result = await resultPromise;
+    expect(result).toEqual({ kind: "input", value: "abc" });
+  });
+
+  it("handles backspace at cursor mid-line", async () => {
+    const input = createMockInput();
+    const output = new PassThrough();
+
+    const resultPromise = readMultiLineInput({
+      prompt: "> ",
+      continuationPrompt: ".. ",
+      input,
+      output,
+    });
+
+    // Type "abcd", left twice (cursor at 'c'), backspace deletes 'b' → "acd"
+    input.write(Buffer.from("abcd"));
+    input.write(Buffer.from("\x1b[D")); // left → col 3
+    input.write(Buffer.from("\x1b[D")); // left → col 2
+    input.write(Buffer.from([0x7f])); // backspace at col 2 → deletes 'b'
+    input.write(Buffer.from([0x0d]));
+
+    const result = await resultPromise;
+    expect(result).toEqual({ kind: "input", value: "acd" });
+  });
+
+  it("arrow up at boundary with no history does not emit ANSI cursor move", async () => {
+    const input = createMockInput();
+    const output = new PassThrough();
+    const chunks: Buffer[] = [];
+    output.on("data", (chunk: Buffer) => chunks.push(chunk));
+
+    const resultPromise = readMultiLineInput({
+      prompt: "> ",
+      continuationPrompt: ".. ",
+      history: [],
+      input,
+      output,
+    });
+
+    // Type "text", then press Up (at row 0, no history) — should not move cursor up
+    input.write(Buffer.from("text"));
+    input.write(Buffer.from("\x1b[A")); // up — should be a no-op at boundary
+
+    // Collect output so far, then submit
+    input.write(Buffer.from([0x0d]));
+    const result = await resultPromise;
+    expect(result).toEqual({ kind: "input", value: "text" });
+
+    // Verify that no ANSI move-up sequence (\x1b[A) was written to output
+    // after the Up arrow was pressed (the prompt itself is written before we type)
+    const allOutput = Buffer.concat(chunks).toString("utf-8");
+    // The initial prompt write is before typing; any move-up in response to
+    // the arrow key would appear after the prompt. We can confirm the cursor
+    // escape we wrote for the arrow key is not present by checking only the
+    // output written AFTER the initial prompt — but the simplest check is that
+    // the total number of ANSI move-up sequences equals those used for legitimate
+    // redraws (zero in a single-line, no-history scenario).
+    const moveUpSequence = "\x1b[A";
+    // Strip the initial prompt from consideration by counting only occurrences
+    // that appear after at least one character of content was written
+    const contentStart = allOutput.indexOf("text");
+    const afterContent = contentStart >= 0 ? allOutput.slice(contentStart) : allOutput;
+    expect(afterContent.includes(moveUpSequence)).toBe(false);
+  });
+
+  it("arrow down at boundary with no history does not emit ANSI cursor move", async () => {
+    const input = createMockInput();
+    const output = new PassThrough();
+    const chunks: Buffer[] = [];
+    output.on("data", (chunk: Buffer) => chunks.push(chunk));
+
+    const resultPromise = readMultiLineInput({
+      prompt: "> ",
+      continuationPrompt: ".. ",
+      history: [],
+      input,
+      output,
+    });
+
+    // Type "text", press Down (at row 0 = last row, no history forward) — should be no-op
+    input.write(Buffer.from("text"));
+    input.write(Buffer.from("\x1b[B")); // down — should be a no-op at boundary
+    input.write(Buffer.from([0x0d]));
+
+    const result = await resultPromise;
+    expect(result).toEqual({ kind: "input", value: "text" });
+
+    const allOutput = Buffer.concat(chunks).toString("utf-8");
+    const moveDownSequence = "\x1b[B";
+    const contentStart = allOutput.indexOf("text");
+    const afterContent = contentStart >= 0 ? allOutput.slice(contentStart) : allOutput;
+    expect(afterContent.includes(moveDownSequence)).toBe(false);
+  });
+
+  it("arrow up within multi-line input moves cursor to previous row", async () => {
+    const input = createMockInput();
+    const output = new PassThrough();
+
+    const resultPromise = readMultiLineInput({
+      prompt: "> ",
+      continuationPrompt: ".. ",
+      input,
+      output,
+    });
+
+    // Type two lines, then navigate up and submit — value should still be correct
+    input.write(Buffer.from("line1"));
+    input.write(Buffer.from("\x1b[13;2u")); // Shift+Enter — creates second line
+    input.write(Buffer.from("line2"));
+    input.write(Buffer.from("\x1b[A")); // up — move to row 0 (within multi-line, not history)
+    input.write(Buffer.from([0x0d])); // Enter from row 0 — submits whole buffer
+
+    const result = await resultPromise;
+    expect(result).toEqual({ kind: "input", value: "line1\nline2" });
+  });
+});
+
+describe("visualLength", () => {
+  it("returns length of plain string unchanged", () => {
+    expect(visualLength("hello")).toBe(5);
+  });
+
+  it("strips ANSI color reset sequence", () => {
+    // "\x1b[0m" is 4 bytes but 0 visual characters
+    expect(visualLength("\x1b[0m")).toBe(0);
+  });
+
+  it("strips ANSI color code and counts surrounding text", () => {
+    // "\x1b[34m> \x1b[0m" — the prompt used in cli/index.ts
+    // Visual content: "> " (2 chars), escapes have zero width
+    expect(visualLength("\x1b[34m> \x1b[0m")).toBe(2);
+  });
+
+  it("strips bold sequence", () => {
+    expect(visualLength("\x1b[1mBOLD\x1b[0m")).toBe(4);
+  });
+
+  it("strips multi-param sequence like dim", () => {
+    expect(visualLength("\x1b[2mtext\x1b[0m")).toBe(4);
+  });
+
+  it("handles string with no escape sequences", () => {
+    expect(visualLength("> ")).toBe(2);
+    expect(visualLength(".. ")).toBe(3);
+  });
+
+  it("handles empty string", () => {
+    expect(visualLength("")).toBe(0);
+  });
+
+  it("handles string that is only escape sequences", () => {
+    expect(visualLength("\x1b[31m\x1b[0m")).toBe(0);
   });
 });
